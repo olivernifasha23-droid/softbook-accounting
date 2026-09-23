@@ -825,6 +825,26 @@ const PENDING_KEY = APP_STORAGE_KEY + '__pending';
 function markPending(){ try{ idbSet(PENDING_KEY, '1'); }catch(e){} }
 function clearPending(){ try{ idbSet(PENDING_KEY, '0'); }catch(e){} }
 async function hasPending(){ try{ return (await idbGet(PENDING_KEY)) === '1'; }catch(e){ return false; } }
+/* ---- durable "which account/team last synced real data on this device" marker. A cloud
+   query that comes back with no row is NOT reliable proof a team/account is brand new — it
+   can also happen from a transient database hiccup (timeout, brief instability) that returns
+   an empty result instead of throwing. Treating "no row" as "definitely new" is what caused a
+   real team's data to be silently replaced with a blank default and pushed over the real
+   cloud copy during exactly this kind of hiccup. This marker lets that check tell the two
+   cases apart: if we've synced this exact identity successfully before AND the local copy
+   still looks like real data, a missing cloud row is treated as suspicious, not as proof of
+   a fresh start. ---- */
+const LAST_SYNCED_ID_KEY = APP_STORAGE_KEY + '__lastSyncedId';
+function noteLastSyncedId(id){ try{ idbSet(LAST_SYNCED_ID_KEY, String(id)); }catch(e){} }
+async function getLastSyncedId(){ try{ return await idbGet(LAST_SYNCED_ID_KEY); }catch(e){ return null; } }
+function looksLikeRealData(data){
+  try{
+    const clients = data && data.clients ? Object.values(data.clients) : [];
+    if(!clients.length) return false;
+    return clients.some(c => (c.gl&&c.gl.length) || (c.bills&&c.bills.length) || (c.invoices&&c.invoices.length) ||
+      (c.customers&&c.customers.length) || (c.payroll&&c.payroll.length) || (c.settings&&c.settings.company&&c.settings.company.name && c.settings.company.name !== 'Your Company Ltd'));
+  }catch(e){ return false; }
+}
 let syncLastError = '';
 function noteSyncError(e){ try{ syncLastError = ((e && (e.message||e.details)) || String(e)) + (e && e.code ? ' [' + e.code + ']' : ''); }catch(_){ syncLastError = 'unknown error'; } }
 let voToastAt = 0;
@@ -992,18 +1012,28 @@ async function pullFromCloud(silent){
       state = appData.clients[appData.activeClientId];
       idbSet(APP_STORAGE_KEY, JSON.stringify(appData)).then(ok=>{ localStorageFull = !ok; });
       cloudReady = true; localDirty = false; if(data.updated_at) lastSyncedStamp = String(data.updated_at);
+      noteLastSyncedId(syncConfig.syncKey);
       syncStatus = 'synced'; updateSyncBadge();
       if(!silent) renderAll();
       return true;
     } else {
-      // Same reasoning as the Team Workspace version of this check — a
-      // sync key with no existing cloud row yet is genuinely new, and
-      // should start from a clean slate rather than seeding with
-      // whatever's currently in memory from a previous session.
+      // A missing cloud row usually means a sync key with no existing data yet — but it can
+      // ALSO mean a transient database hiccup returned an empty result instead of a real
+      // error. Only treat this as "genuinely new" when there's no evidence otherwise: if this
+      // exact sync key already has real-looking data synced on this device before, refuse to
+      // silently replace it with a blank default and push over whatever's really in the cloud.
+      const lastId = await getLastSyncedId();
+      if(lastId === syncConfig.syncKey && looksLikeRealData(appData)){
+        console.error('Cloud pull found no row for a sync key that previously had real data — refusing to overwrite with a blank default.');
+        noteSyncError('Could not find your existing data in the cloud just now. To protect your work, nothing was changed or overwritten. Please check your connection and try again shortly.');
+        syncStatus = 'error'; updateSyncBadge();
+        return false;
+      }
       appData = defaultAppData();
       state = appData.clients[appData.activeClientId];
       cloudReady = true;
       await pushToCloud(true);
+      noteLastSyncedId(syncConfig.syncKey);
       if(!silent) renderAll();
       return true;
     }
@@ -1030,6 +1060,7 @@ function pushToCloud(immediate){
       if(error) throw error;
       lastSyncedStamp = stamp;
       if(seq === saveSeq){ localDirty = false; clearPending(); } // nothing newer was saved while this was in flight
+      noteLastSyncedId(syncConfig.syncKey);
     } finally { pushInFlight--; }
   };
   const doPush = async ()=>{
@@ -1612,24 +1643,36 @@ async function pullFromCloudAuth(silent){
       state = appData.clients[appData.activeClientId];
       idbSet(APP_STORAGE_KEY, JSON.stringify(appData)).then(ok=>{ localStorageFull = !ok; });
       cloudReady = true; localDirty = false; if(data.updated_at) lastSyncedStamp = String(data.updated_at);
+      noteLastSyncedId(keyVal);
       syncStatus = 'synced'; updateSyncBadge();
       if(!silent) renderAll();
       return true;
     } else {
-      // No cloud row exists yet for this team — meaning it's genuinely
-      // new. Reset to a clean, single default company before seeding it,
-      // rather than pushing up whatever happens to already be sitting in
-      // memory. That "current local data" could be leftover from a
-      // previous session on this same browser (a different team
-      // entirely) — pushing it here would seed a brand-new workspace
-      // with another workspace's companies, a real cross-tenant leak.
-      // A genuinely brand-new team should always start from a blank
-      // slate, never from ambient state left behind by whoever used this
-      // browser before.
+      // No cloud row can mean a genuinely new team — or it can mean a transient database
+      // hiccup returned an empty result instead of a real error (exactly what happened during
+      // an earlier outage, which silently replaced a month-old team's real data with a blank
+      // default). Only treat this as "genuinely new" when there's no evidence otherwise: if
+      // this exact team/user id already had real-looking data synced successfully on this
+      // device before, refuse to overwrite it with a blank default.
+      const lastId = await getLastSyncedId();
+      if(lastId === keyVal && looksLikeRealData(appData)){
+        console.error('Cloud pull found no row for a team/user that previously had real data — refusing to overwrite with a blank default.');
+        noteSyncError('Could not find your existing data in the cloud just now. To protect your work, nothing was changed or overwritten. Please check your connection and try again shortly.');
+        syncStatus = 'error'; updateSyncBadge();
+        return false;
+      }
+      // Otherwise this really does look like a fresh team/browser combination — reset to a
+      // clean, single default company before seeding it, rather than pushing up whatever
+      // happens to already be sitting in memory. That "current local data" could be leftover
+      // from a previous session on this same browser (a different team entirely) — pushing it
+      // here would seed a brand-new workspace with another workspace's companies, a real
+      // cross-tenant leak. A genuinely brand-new team should always start from a blank slate,
+      // never from ambient state left behind by whoever used this browser before.
       appData = defaultAppData();
       state = appData.clients[appData.activeClientId];
       cloudReady = true;
       await pushToCloudAuth(true);
+      noteLastSyncedId(keyVal);
       if(!silent) renderAll();
       return true;
     }
@@ -1663,6 +1706,7 @@ function pushToCloudAuth(immediate){
     if(error) throw error;
     lastSyncedStamp = stamp;
     if(seq === saveSeq){ localDirty = false; clearPending(); } // nothing newer was saved while this was in flight
+    noteLastSyncedId(authTeam ? authTeam.id : authUser.id);
     if(authTeam){
       // keep a lightweight index of company name+TIN per workspace, so the
       // owner console can list "which company, which TIN" without reading
@@ -2302,6 +2346,34 @@ function sumAccount(code, from, to, side){
   return debit-credit;
 }
 
+// For an account with any foreign-currency transactions on it (each GL
+// line entered in a foreign currency keeps its own original amount and
+// currency code alongside the converted RWF figure), reconstructs the
+// running balance in that native currency — so a USD bank account (or a
+// USD-denominated expense, like a bank charge billed in USD) can show its
+// real foreign-currency amount in parentheses next to the RWF figure that
+// actually drives every report total. Shared by the Balance Sheet and the
+// Income Statement so both display this the same way.
+function nativeCurrencyBalance(code, from, to){
+  let byCurrency = {};
+  state.gl.forEach(l=>{
+    if(l.account!==code || !l.currency) return;
+    if(to && !inRange(l.date, from, to)) return;
+    byCurrency[l.currency] = (byCurrency[l.currency]||0) + (Number(l.originalDebit)||0) - (Number(l.originalCredit)||0);
+  });
+  const entries = Object.entries(byCurrency).filter(([,amt])=>Math.abs(amt)>=0.005);
+  return entries.length ? entries : null;
+}
+
+// Renders a line's native-currency breakdown (if any) as "(103USD)", tight
+// against the RWF figure it follows — e.g. "150,000(103USD)". Used by both
+// the Income Statement and the Balance Sheet so foreign-currency-sourced
+// figures always look the same wherever they appear. The RWF amount is
+// always what drives the report's own totals; this is reference only.
+function nativeText(line){
+  return line.native ? line.native.map(([cur,amt])=> '(' + fmt(Math.abs(amt)) + cur + ')').join(' ') : '';
+}
+
 function computePL(from, to, basis){
   basis = basis || 'accrual';
   const sum = basis==='cash' ? sumAccountCashBasis : sumAccount;
@@ -2311,11 +2383,11 @@ function computePL(from, to, basis){
   // the P&L too, rather than always showing a fixed template of accounts
   // regardless of what this client actually uses.
   const revenueAccounts = state.accounts.filter(a=>a.type==='Income').sort((a,b)=>a.code.localeCompare(b.code));
-  const revenueLines = revenueAccounts.map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'credit') - sum(a.code, from, to, 'debit')}));
+  const revenueLines = revenueAccounts.map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'credit') - sum(a.code, from, to, 'debit'), native: nativeCurrencyBalance(a.code, from, to)}));
   const totalRevenue = revenueLines.reduce((s,r)=>s+r.amt,0);
 
   const cosAccounts = state.accounts.filter(a=>a.type==='Expense' && getAccountClassification(a)==='Cost of Sales').sort((a,b)=>a.code.localeCompare(b.code));
-  const cosLines = cosAccounts.map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to, 'credit')}));
+  const cosLines = cosAccounts.map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to, 'credit'), native: nativeCurrencyBalance(a.code, from, to)}));
   const hasCos = cosAccounts.length > 0;
   const cos = cosLines.reduce((s,c)=>s+c.amt,0);
   const grossProfit = totalRevenue - cos;
@@ -2323,7 +2395,7 @@ function computePL(from, to, basis){
   const opex = state.accounts
     .filter(a=>a.type==='Expense' && getAccountClassification(a)==='Operating Expense')
     .sort((a,b)=>a.code.localeCompare(b.code))
-    .map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to,'credit')}));
+    .map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to,'credit'), native: nativeCurrencyBalance(a.code, from, to)}));
   const totalOpex = opex.reduce((s,o)=>s+o.amt,0);
   const operatingProfit = grossProfit - totalOpex;
 
@@ -2334,7 +2406,7 @@ function computePL(from, to, basis){
   const otherExpenseLines = state.accounts
     .filter(a=>a.type==='Expense' && getAccountClassification(a)==='Other Expense')
     .sort((a,b)=>a.code.localeCompare(b.code))
-    .map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to,'credit')}));
+    .map(a=>({code:a.code, name:a.name, amt: sum(a.code, from, to, 'debit') - sum(a.code, from, to,'credit'), native: nativeCurrencyBalance(a.code, from, to)}));
   const totalOtherExpense = otherExpenseLines.reduce((s,o)=>s+o.amt,0);
 
   const netBeforeTax = operatingProfit - totalOtherExpense;
@@ -2353,23 +2425,6 @@ function computeBalanceSheet(asOf){
   const from = null, to = asOf;
   const asset = (code)=> sumAccount(code, from, to, 'net');
   const liabEq = (code)=> -sumAccount(code, from, to, 'net');
-
-  // For an account with any foreign-currency transactions on it (each GL
-  // line entered in a foreign currency keeps its own original amount and
-  // currency code alongside the converted RWF figure), reconstructs the
-  // running balance in that native currency — so a USD bank account can
-  // show its real USD balance in parentheses next to the RWF figure that
-  // actually drives the report's totals.
-  function nativeCurrencyBalance(code){
-    let byCurrency = {};
-    state.gl.forEach(l=>{
-      if(l.account!==code || !l.currency) return;
-      if(to && !inRange(l.date, from, to)) return;
-      byCurrency[l.currency] = (byCurrency[l.currency]||0) + (Number(l.originalDebit)||0) - (Number(l.originalCredit)||0);
-    });
-    const entries = Object.entries(byCurrency).filter(([,amt])=>Math.abs(amt)>=0.005);
-    return entries.length ? entries : null;
-  }
 
   // Same principle as the P&L: built from whatever Asset/Liability/Equity
   // accounts actually exist in this client's own Chart of Accounts, not a
@@ -2390,12 +2445,12 @@ function computeBalanceSheet(asOf){
   // vatClaimedBalance()/vatPayableBalance() on the VAT Report exactly.
   const VAT_BS_HIDDEN_CODES = ['1300','2100','1310','2105'];
   const assetAccounts = state.accounts.filter(a=>a.type==='Asset' && !VAT_BS_HIDDEN_CODES.includes(a.code)).sort((a,b)=>a.code.localeCompare(b.code));
-  const currentAssets = assetAccounts.filter(a=>getAccountClassification(a)==='Current').map(a=>({code:a.code, name:a.name, amt:asset(a.code), native:nativeCurrencyBalance(a.code)}));
-  const nonCurrentAssets = assetAccounts.filter(a=>getAccountClassification(a)==='Non-Current').map(a=>({code:a.code, name:a.name, amt:asset(a.code), native:nativeCurrencyBalance(a.code)}));
+  const currentAssets = assetAccounts.filter(a=>getAccountClassification(a)==='Current').map(a=>({code:a.code, name:a.name, amt:asset(a.code), native:nativeCurrencyBalance(a.code, from, to)}));
+  const nonCurrentAssets = assetAccounts.filter(a=>getAccountClassification(a)==='Non-Current').map(a=>({code:a.code, name:a.name, amt:asset(a.code), native:nativeCurrencyBalance(a.code, from, to)}));
 
   const liabAccounts = state.accounts.filter(a=>a.type==='Liability' && !VAT_BS_HIDDEN_CODES.includes(a.code)).sort((a,b)=>a.code.localeCompare(b.code));
-  const currentLiab = liabAccounts.filter(a=>getAccountClassification(a)==='Current').map(a=>({code:a.code, name:a.name, amt:liabEq(a.code), native:nativeCurrencyBalance(a.code)}));
-  const nonCurrentLiab = liabAccounts.filter(a=>getAccountClassification(a)==='Non-Current').map(a=>({code:a.code, name:a.name, amt:liabEq(a.code), native:nativeCurrencyBalance(a.code)}));
+  const currentLiab = liabAccounts.filter(a=>getAccountClassification(a)==='Current').map(a=>({code:a.code, name:a.name, amt:liabEq(a.code), native:nativeCurrencyBalance(a.code, from, to)}));
+  const nonCurrentLiab = liabAccounts.filter(a=>getAccountClassification(a)==='Non-Current').map(a=>({code:a.code, name:a.name, amt:liabEq(a.code), native:nativeCurrencyBalance(a.code, from, to)}));
 
   // VAT Claimed (Asset) stays conservative — only the settled, formally
   // closed-month amount (vatClaimedBalance, account 1310). An asset
@@ -7363,15 +7418,46 @@ async function parseBankStatementPdf(file){
   return {staged};
 }
 
+// Finds the client's own "Funds Held for a Client" account by name (case-
+// insensitive) if one exists in their Chart of Accounts. This business
+// holds bank funds on behalf of clients rather than treating every deposit
+// as its own income, so by agreed policy that's the default counterpart
+// account for a bank-imported transaction — pre-filled, never forced: any
+// row can still be reassigned before posting (a genuine bank charge, for
+// instance, should be moved to its own expense account).
+function fundsHeldAccountCode(){
+  const acct = state.accounts.find(a=>/funds\s*held/i.test(a.name));
+  return acct ? acct.code : null;
+}
+
 // Checks the client's own saved rules (built up over time as they correct
 // imports) for a keyword that appears in this transaction's description —
-// case-insensitive substring match, first rule that matches wins. Returns
-// null (not a guess) when nothing matches, so it's obvious on the review
-// screen which transactions still need a human decision.
+// case-insensitive substring match, first rule that matches wins. Falls
+// back to "Funds Held for a Client" (see above) when no rule matches and
+// that account exists; otherwise returns null, same as before, so it's
+// obvious on the review screen which transactions still need a human
+// decision.
 function suggestBankRuleAccount(description){
   const d = description.toLowerCase();
   const rule = (state.bankRules||[]).find(r=> r.keyword && d.includes(r.keyword.toLowerCase()));
-  return rule ? rule.accountCode : null;
+  if(rule) return rule.accountCode;
+  return fundsHeldAccountCode();
+}
+
+// True when a bank/cash account's own name is consistent with the given
+// transaction currency — a foreign-currency import (e.g. "USD") should
+// name-match an account like "Bank Account (USD)", while a base-currency
+// import should NOT match an account named after any OTHER configured
+// foreign currency. Used only to warn on an apparent mismatch before
+// posting (e.g. picking "Bank Account (RWF)" while the currency dropdown
+// is still set to USD) — never to block a deliberate, correctly-named
+// account choice this can't anticipate.
+function accountMatchesCurrency(acct, currencyCode){
+  if(!acct) return true;
+  const name = acct.name.toLowerCase();
+  const foreignCodes = (state.currencies||[]).filter(c=>!c.base).map(c=>c.code.toLowerCase());
+  if(currencyCode) return name.includes(String(currencyCode).toLowerCase());
+  return !foreignCodes.some(code=>name.includes(code));
 }
 
 // Posts one staged transaction as a proper double-entry GL line: the bank
@@ -8103,23 +8189,23 @@ function renderPL(){
       <table class="led">
         <tbody>
           <tr><td colspan="2" style="font-weight:700;color:var(--ledger-green-dk);">Revenue</td></tr>
-          ${revenueLines.map(r=>`<tr><td>${esc(tAccountName(r.code, r.name))}</td><td class="num-col num">${fmt(r.amt)}</td></tr>`).join('')}
+          ${revenueLines.map(r=>`<tr><td>${esc(tAccountName(r.code, r.name))}</td><td class="num-col num">${fmt(r.amt)}${nativeText(r)}</td></tr>`).join('')}
           <tr class="total-row"><td>Total Revenue</td><td class="num-col num">${fmt(pl.totalRevenue)}</td></tr>
 
           ${pl.hasCos ? `
           <tr><td colspan="2" style="padding-top:16px;font-weight:700;color:var(--ledger-green-dk);">Cost of Sales</td></tr>
-          ${cosLines.map(c=>`<tr><td>${esc(tAccountName(c.code, c.name))}</td><td class="num-col num">${fmt(c.amt)}</td></tr>`).join('')}
+          ${cosLines.map(c=>`<tr><td>${esc(tAccountName(c.code, c.name))}</td><td class="num-col num">${fmt(c.amt)}${nativeText(c)}</td></tr>`).join('')}
           <tr class="total-row"><td>Total Cost of Sales</td><td class="num-col num">${fmt(pl.cos)}</td></tr>
           <tr class="total-row"><td>Gross Profit</td><td class="num-col num">${fmt(pl.grossProfit)}</td></tr>` : ''}
 
           <tr><td colspan="2" style="padding-top:16px;font-weight:700;color:var(--ledger-green-dk);">Operating Expenses</td></tr>
-          ${opexLines.map(o=>`<tr><td>${esc(tAccountName(o.code, o.name))}</td><td class="num-col num">${fmt(o.amt)}</td></tr>`).join('')}
+          ${opexLines.map(o=>`<tr><td>${esc(tAccountName(o.code, o.name))}</td><td class="num-col num">${fmt(o.amt)}${nativeText(o)}</td></tr>`).join('')}
           <tr class="total-row"><td>Total Operating Expenses</td><td class="num-col num">${fmt(pl.totalOpex)}</td></tr>
           <tr class="total-row"><td>Operating Profit</td><td class="num-col num ${pl.operatingProfit<0?'neg':''}">${fmt(pl.operatingProfit)}</td></tr>
 
           ${pl.hasOtherExpense ? `
           <tr><td colspan="2" style="padding-top:16px;font-weight:700;color:var(--ledger-green-dk);">Other Expenses (Non-Operating)</td></tr>
-          ${otherExpLines.map(o=>`<tr><td>${esc(tAccountName(o.code, o.name))}</td><td class="num-col num">${fmt(o.amt)}</td></tr>`).join('')}
+          ${otherExpLines.map(o=>`<tr><td>${esc(tAccountName(o.code, o.name))}</td><td class="num-col num">${fmt(o.amt)}${nativeText(o)}</td></tr>`).join('')}
           <tr class="total-row"><td>Total Other Expenses</td><td class="num-col num">${fmt(pl.totalOtherExpense)}</td></tr>` : ''}
 
           <tr style="height:8px;"><td colspan="2"></td></tr>
@@ -8150,8 +8236,7 @@ function renderBS(){
     // — the native-currency amount is shown purely for reference, next
     // to it, never used in any subtotal or the Total Assets/Liabilities
     // figure itself.
-    const nativeText = a.native ? ' (' + a.native.map(([cur,amt])=> fmt(Math.abs(amt))+' '+esc(cur)).join(', ') + ')' : '';
-    return `<tr><td>${nameCell}</td><td class="num-col num">${fmt(a.amt)}${nativeText}</td></tr>`;
+    return `<tr><td>${nameCell}</td><td class="num-col num">${fmt(a.amt)}${nativeText(a)}</td></tr>`;
   };
   return `
     ${reportHeader(t('title_bs'), `${t('bs_sub_prefix')} ${asOfDate}.`)}
@@ -12435,7 +12520,17 @@ function wireViewEvents(){
     const acctSel = document.getElementById('bankImportAccountSelect');
     if(acctSel) acctSel.onchange = ()=>{ bankImportAccount = acctSel.value; renderMain(); };
     const currSel = document.getElementById('bankImportCurrencySelect');
-    if(currSel) currSel.onchange = ()=>{ bankImportCurrency = currSel.value || null; bankImportFxRate = ''; renderMain(); };
+    if(currSel) currSel.onchange = ()=>{
+      bankImportCurrency = currSel.value || null;
+      bankImportFxRate = '';
+      // Switch the bank account too, but only when exactly one of this
+      // client's cash/bank accounts unambiguously matches the newly
+      // chosen currency by name — anything less certain is left for the
+      // mismatch check at upload time instead of guessing.
+      const matches = cashBankAccounts().filter(a=>accountMatchesCurrency(a, bankImportCurrency));
+      if(matches.length===1) bankImportAccount = matches[0].code;
+      renderMain();
+    };
     const fxInput = document.getElementById('bankImportFxRateInput');
     if(fxInput) fxInput.onchange = ()=>{ bankImportFxRate = fxInput.value; };
     const updateRateBtn = document.getElementById('bankImportUpdateRateBtn');
@@ -12459,6 +12554,14 @@ function wireViewEvents(){
       if(!file) return;
       if(!bankImportAccount){ alert('Choose a Bank Account first.'); return; }
       if(bankImportCurrency && !(parseFloat(bankImportFxRate)>0)){ alert('Enter a default exchange rate for '+bankImportCurrency+' first.'); return; }
+      {
+        const selectedAcct = state.accounts.find(a=>a.code===bankImportAccount);
+        if(selectedAcct && !accountMatchesCurrency(selectedAcct, bankImportCurrency)){
+          const label = bankImportCurrency ? bankImportCurrency : baseCurrencyCode()+' (base currency)';
+          const proceed = confirm(`You picked "${selectedAcct.name}" as the bank account, but the transaction currency is set to ${label} — these don't look like they match.\n\nContinue anyway, or press Cancel to fix the Bank Account / Currency selection first.`);
+          if(!proceed){ fileInput.value=''; return; }
+        }
+      }
 
       // Shared by both the CSV/Excel and PDF paths below — tags every
       // staged row with the bank account and currency chosen for this
