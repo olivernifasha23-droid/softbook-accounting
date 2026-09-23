@@ -6731,6 +6731,8 @@ function buildHeaderMap(row){
 function inferAccountType(name){
   const n = name.toLowerCase();
   if(/fixed asset|equipment|vehicle|property|building|accumulated depreciation/.test(n)) return {type:'Asset', normal:'Debit', classification:'Non-Current'};
+  if(/output\s*vat|vat\s*output|vat\s*payable/.test(n)) return {type:'Liability', normal:'Credit', classification:'Current'};
+  if(/input\s*vat|vat\s*input|vat\s*receivable/.test(n)) return {type:'Asset', normal:'Debit', classification:'Current'};
   if(/payable|loan|liability/.test(n)) return {type:'Liability', normal:'Credit', classification:'Current'};
   if(/receivable/.test(n)) return {type:'Asset', normal:'Debit', classification:'Current'};
   if(/equity|capital|retained earnings/.test(n)) return {type:'Equity', normal:'Credit'};
@@ -7182,23 +7184,56 @@ function findAccountByCodeOrName(raw){
       || null;
 }
 
-/* ---- Format A: plain journal (Date, Account, Memo, Debit, Credit, Entry) ---- */
+/* ---- Format A: plain journal (Date, Account, Memo, Debit, Credit, Entry —
+   Name is also accepted and folded into Memo). Entry is optional: most
+   hand-kept sheets don't have one, so when it's missing, each transaction's
+   own boundary is detected from where its running debits and credits
+   balance out (same technique as Format C below) rather than lumping every
+   row in the file into one shared group. A blank-account row (a per-account
+   subtotal line, or a blank spacer between entries) is simply skipped —
+   totals are recomputed from the posted lines after saving, so the sheet's
+   own printed subtotals never need to be read or trusted. Any account name
+   not already in the Chart of Accounts is created automatically, on the
+   assumption a hand-typed sheet will always have a few names that don't
+   exactly match the existing chart yet. ---- */
 function importFormatJournal(rows, headerMap){
   let imported=0, skipped=0;
+  const created=[];
+  const hasEntryCol = !!headerMap['entry'];
+  const nameCol = headerMap['name'];
+  const collected = [];
   rows.forEach(r=>{
     const accountRaw = String(r[headerMap['account']]||'').trim();
-    const memo = headerMap['memo'] ? String(r[headerMap['memo']]||'') : '';
+    const memoRaw = headerMap['memo'] ? String(r[headerMap['memo']]||'').trim() : '';
+    const nameRaw = nameCol ? String(r[nameCol]||'').trim() : '';
     const debit = parseNum(r[headerMap['debit']]);
     const credit = parseNum(r[headerMap['credit']]);
-    const entry = headerMap['entry'] ? String(r[headerMap['entry']]||'') : '';
-    if(!accountRaw || (!debit && !credit)){ skipped++; return; }
-    const acct = findAccountByCodeOrName(accountRaw);
-    if(!acct){ skipped++; return; }
+    if(!accountRaw || (!debit && !credit)){ skipped++; return; } // subtotal row or blank spacer — not a real line
+    const memo = nameRaw && memoRaw ? `${nameRaw} — ${memoRaw}` : (nameRaw || memoRaw);
     const dateStr = parseImportedDate(r[headerMap['date']]);
-    state.gl.push({id:uid(), date:dateStr, entry, account:acct.code, memo, debit, credit});
-    imported++;
+    const entry = hasEntryCol ? String(r[headerMap['entry']]||'').trim() : '';
+    collected.push({date:dateStr, accountRaw, memo, debit, credit, entry});
   });
-  return {imported, skipped, created:[]};
+
+  function postLine(line, ref){
+    const acct = findAccountByCodeOrName(line.accountRaw) || findOrCreateAccountByName(line.accountRaw, created);
+    if(!acct){ skipped++; return; }
+    state.gl.push({id:uid(), date:line.date, entry:ref, account:acct.code, memo:line.memo, debit:line.debit, credit:line.credit});
+    imported++;
+  }
+
+  if(hasEntryCol){
+    collected.forEach(line=> postLine(line, line.entry || ('JE-IMP-'+uid().slice(0,6))));
+  } else {
+    let groupNum = 0;
+    splitIntoBalancedTransactions(collected).forEach(group=>{
+      groupNum++;
+      const ref = 'JE-IMP-'+groupNum;
+      group.forEach(line=> postLine(line, ref));
+    });
+  }
+
+  return {imported, skipped, created};
 }
 
 /* ---- Format B: purchase/receipt register (Supplier TIN, Supplier name,
