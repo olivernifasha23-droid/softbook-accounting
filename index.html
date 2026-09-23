@@ -1374,6 +1374,7 @@ function requireActiveSubscription(actionLabel){
 // needs its own 5,000 RWF add-on payment before it can be created.
 function hasFreeClientSlot(){
   if(!BILLING_ENABLED || !authTeam) return true; // not billed — unrestricted
+  if(isPlatformOwner()) return true; // the platform owner is never charged for their own companies
   const slots = authTeam.paidClientSlots || 1;
   return appData.clientOrder.length < slots;
 }
@@ -1405,6 +1406,18 @@ let momoPollTimer = null;
 let pendingNewClientName = null; // set while an extra-client payment is in progress
 let pendingNewClientTin = null;
 
+// Reads an Edge Function response safely: a crashed function often returns
+// plain text / HTML, which made resp.json() throw and looked like "no network".
+async function readFunctionResponse(resp){
+  const text = await resp.text();
+  try{ return JSON.parse(text); }
+  catch(e){ return {ok:false, msg:`Payment server error (HTTP ${resp.status}): ${String(text||resp.statusText||'no details').slice(0,160)}`}; }
+}
+function paymentNetworkErrorText(e){
+  const m = String(e && e.message || e || '');
+  return `Could not reach the payment server (${m||'network error'}). Check your internet connection; if it keeps happening, the "momo-create-code" function in Supabase → Edge Functions may be down.`;
+}
+
 async function startExtraClientPayment(phoneRaw){
   if(!authUser || !authTeam){ alert('Sign in and set up a Team Workspace first.'); return; }
   const phone = phoneRaw ? normalizeRwandaMsisdn(phoneRaw) : null;
@@ -1422,7 +1435,7 @@ async function startExtraClientPayment(phoneRaw){
       headers: {'Content-Type':'application/json', 'Authorization': `Bearer ${token}`, 'apikey': syncConfig.anonKey},
       body: JSON.stringify({team_id: authTeam.id, payment_type: 'extra_client', phone})
     });
-    const result = await resp.json();
+    const result = await readFunctionResponse(resp);
     if(!result || !result.ok){
       if(statusBox) statusBox.innerHTML = `<p style="font-size:12px;color:#e08a80;">${esc(result && result.msg || 'Could not create a payment code.')}</p>`;
       return;
@@ -1437,7 +1450,7 @@ async function startExtraClientPayment(phoneRaw){
     pollMomoPayment(result.reference_id, statusBox);
   }catch(e){
     console.error('startExtraClientPayment failed:', e.message||e);
-    if(statusBox) statusBox.innerHTML = `<p style="font-size:12px;color:#e08a80;">Could not reach the payment server.</p>`;
+    if(statusBox) statusBox.innerHTML = `<p style="font-size:12px;color:#e08a80;">${esc(paymentNetworkErrorText(e))}</p>`;
   }
 }
 
@@ -1465,7 +1478,7 @@ async function startMomoPayment(planKey, phoneRaw){
       headers: {'Content-Type':'application/json', 'Authorization': `Bearer ${token}`, 'apikey': syncConfig.anonKey},
       body: JSON.stringify({team_id: authTeam.id, plan: planKey, phone})
     });
-    const result = await resp.json();
+    const result = await readFunctionResponse(resp);
     if(!result || !result.ok){
       if(statusBox) statusBox.innerHTML = `<p style="font-size:13px;color:var(--ink-red);">${esc(result && result.msg || 'Could not create a payment code.')}</p>`;
       return;
@@ -1480,7 +1493,7 @@ async function startMomoPayment(planKey, phoneRaw){
     pollMomoPayment(result.reference_id, statusBox);
   }catch(e){
     console.error('startMomoPayment failed:', e.message||e);
-    if(statusBox) statusBox.innerHTML = `<p style="font-size:13px;color:var(--ink-red);">Could not reach the payment server. Check your connection and try again.</p>`;
+    if(statusBox) statusBox.innerHTML = `<p style="font-size:13px;color:var(--ink-red);">${esc(paymentNetworkErrorText(e))}</p>`;
   }
 }
 
