@@ -3164,6 +3164,148 @@ function solveBasicForTargetNet(targetNet, transport, meal, forDate){
   return Math.round((lo+hi)/2);
 }
 
+/* ============================================================
+   PAYROLL IMPORT (bulk Employees + monthly salary from Excel/CSV)
+   Expected columns (any order, case-insensitive): First Name, Last Name,
+   Branch, ID Number, Account Number, RSSB Number, and one column named
+   after the payroll month it covers (e.g. "September") holding each
+   employee's take-home Net Pay for that month. "Branch" is read as the
+   employee's bank (the sheets this maps use bank short codes like BK,
+   GTCO, BPR, EQUITY) so it feeds the existing Bank Distribution report.
+   Since the sheet gives take-home pay, not Basic Salary, each row's
+   Basic Salary is back-solved with solveBasicForTargetNet() — the exact
+   same math already used by the "Compute Basic Salary from Net Pay"
+   button — so running payroll afterwards reproduces that exact Net Pay
+   through the app's normal PAYE/RSSB calculation. Employees already in
+   Payroll are matched by ID Number (falling back to RSSB Number) and
+   updated in place rather than duplicated, so re-importing next month's
+   sheet just refreshes salaries instead of piling up new records.
+   ============================================================ */
+const PAYROLL_MONTH_NAMES = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+
+function findPayrollSalaryColumn(headerMap, forMonth){
+  const monthNum = forMonth ? Number(String(forMonth).slice(5,7)) : null;
+  const preferredName = (monthNum>=1 && monthNum<=12) ? PAYROLL_MONTH_NAMES[monthNum-1] : null;
+  const keys = Object.keys(headerMap);
+  if(preferredName){
+    const exact = keys.find(k=>k===preferredName);
+    if(exact) return {key: headerMap[exact], monthName: preferredName};
+    const contains = keys.find(k=>k.includes(preferredName));
+    if(contains) return {key: headerMap[contains], monthName: preferredName};
+  }
+  // No exact match for the currently-selected payroll month — fall back to
+  // whichever month name actually appears in the sheet's headers, so the
+  // file still imports even if "Run payroll for" hasn't been set yet.
+  for(const mn of PAYROLL_MONTH_NAMES){
+    const found = keys.find(k=>k.includes(mn));
+    if(found) return {key: headerMap[found], monthName: mn};
+  }
+  return null;
+}
+
+function importPayrollFromRows(rows, headerMap, forMonth){
+  const missing = ['first name','last name'].filter(k=>!headerMap[k]);
+  if(missing.length){
+    return {error: 'Missing required column(s) for Payroll import: ' + missing.join(', ') + '.\n\n'
+      + 'Expected columns (any order, case-insensitive): First Name, Last Name, Branch, ID Number, Account Number, RSSB Number, and a column named after the payroll month it covers (e.g. "September").'};
+  }
+  const salaryCol = findPayrollSalaryColumn(headerMap, forMonth);
+  if(!salaryCol){
+    return {error: 'Could not find a salary column — name one column after the month it covers (e.g. "September", "October").'};
+  }
+  const fallbackYear = Number(String(forMonth||todayISO()).slice(0,4)) || Number(todayISO().slice(0,4));
+  const monthIndex = PAYROLL_MONTH_NAMES.indexOf(salaryCol.monthName);
+  const forDate = `${fallbackYear}-${String(monthIndex+1).padStart(2,'0')}-01`;
+
+  // Match only against employees that already existed BEFORE this import —
+  // never against a record this same import just created. Otherwise two
+  // different people who happen to share a mistyped ID/RSSB number in the
+  // source sheet would silently collapse into one employee instead of
+  // being flagged as the data problem they are.
+  const existingSnapshot = state.payroll.slice();
+  const seenIdsThisFile = new Map();
+
+  let created = 0, updated = 0;
+  const skipped = [];
+  rows.forEach((r,i)=>{
+    const first = String(r[headerMap['first name']]==null ? '' : r[headerMap['first name']]).trim();
+    const last = String(r[headerMap['last name']]==null ? '' : r[headerMap['last name']]).trim();
+    const name = (first+' '+last).trim();
+    const idNumber = headerMap['id number'] ? String(r[headerMap['id number']]==null?'':r[headerMap['id number']]).trim() : '';
+    const accountNumber = headerMap['account number'] ? String(r[headerMap['account number']]==null?'':r[headerMap['account number']]).trim() : '';
+    const rssbNumber = headerMap['rssb number'] ? String(r[headerMap['rssb number']]==null?'':r[headerMap['rssb number']]).trim() : '';
+    const bankName = headerMap['branch'] ? String(r[headerMap['branch']]==null?'':r[headerMap['branch']]).trim() : '';
+    const targetNet = parseNum(r[salaryCol.key]);
+
+    // A wholly blank row (subtotal/spacer rows, or a stray blank line at
+    // the end of the sheet) is expected, not a problem — skip it silently.
+    if(!name && !idNumber && !rssbNumber && targetNet<=0) return;
+
+    if(!name){ skipped.push({row:i+2, name:'', reason:'no name given'}); return; }
+    if(targetNet<=0){ skipped.push({row:i+2, name, reason:`no salary amount in the "${salaryCol.key}" column`}); return; }
+    if(idNumber && seenIdsThisFile.has(idNumber)){
+      skipped.push({row:i+2, name, reason:`ID Number ${idNumber} is also used by "${seenIdsThisFile.get(idNumber)}" earlier in this same file — fix the spreadsheet (each employee needs their own ID Number) and re-import this person once it's corrected`});
+      return;
+    }
+    if(idNumber) seenIdsThisFile.set(idNumber, name);
+
+    const basic = solveBasicForTargetNet(targetNet, 0, 0, forDate);
+    const emp = (idNumber && existingSnapshot.find(e=>e.idNumber && e.idNumber===idNumber))
+      || (rssbNumber && existingSnapshot.find(e=>e.rssbNumber && e.rssbNumber===rssbNumber));
+
+    const fields = {
+      name, familyName: last, otherNames: first,
+      bankName, bankAccount: accountNumber, rssbNumber, idNumber,
+      basic, workedThisMonth: true,
+    };
+    if(emp){
+      Object.assign(emp, fields);
+      updated++;
+    } else {
+      state.payroll.push(Object.assign({
+        id: uid(), idType:'national_id', position:'', branch:'',
+        transport:0, meal:0, transportReimb:0, mealReimb:0, consultFee:0, startDate:'',
+      }, fields));
+      created++;
+    }
+  });
+
+  if(created>0 || updated>0) saveState();
+  return {created, updated, skipped, monthUsed: salaryCol.monthName, forDate, salaryColumnHeader: salaryCol.key};
+}
+
+function handlePayrollImportFile(file){
+  if(typeof XLSX === 'undefined'){ alert('Import library did not load — check your internet connection and reload the page.'); return; }
+  const reader = new FileReader();
+  reader.onload = (e)=>{
+    try{
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, {type:'array', raw:true});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, {defval:''});
+      if(rows.length===0){ alert('No rows found in that file.'); return; }
+      const headerMap = buildHeaderMap(rows[0]);
+      const forMonth = payrollRunMonth || todayISO().slice(0,7);
+      const result = importPayrollFromRows(rows, headerMap, forMonth);
+      if(result.error){ alert(result.error); return; }
+      renderMain();
+      let msg = `Imported payroll for ${monthLabelOf(result.forDate)} using the "${result.salaryColumnHeader}" column:\n\n`
+        + `${result.created} new employee(s) added\n`
+        + `${result.updated} existing employee(s) updated (matched by ID Number / RSSB Number)`;
+      if(result.skipped.length){
+        msg += `\n\n${result.skipped.length} row(s) skipped:\n` + result.skipped.slice(0,10).map(s=>`Row ${s.row}${s.name?' ('+s.name+')':''}: ${s.reason}`).join('\n');
+        if(result.skipped.length>10) msg += `\n…and ${result.skipped.length-10} more.`;
+      }
+      const monthTitleCase = result.monthUsed.charAt(0).toUpperCase() + result.monthUsed.slice(1);
+      msg += `\n\nEach person's Basic Salary was back-calculated from their ${monthTitleCase} take-home pay, so running payroll reproduces that same Net Pay after PAYE, Pension, Maternity and CBHI — check the Monthly Payroll table below.`;
+      alert(msg);
+    }catch(err){
+      alert('Could not read that file: ' + err.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
 function computeVATReport(from, to){
   const outputVAT = sumAccount('2100', from, to, 'credit') - sumAccount('2100', from, to, 'debit');
   const inputVAT = sumAccount('1300', from, to, 'debit') - sumAccount('1300', from, to, 'credit');
@@ -8765,6 +8907,8 @@ function renderPayroll(){
           <label style="font-size:12px;color:var(--text-soft);font-weight:600;">Run payroll for:</label>
           <input type="month" id="pRunMonth" value="${payrollRunMonth}" style="padding:6px 8px;border:1px solid var(--rule-dk);border-radius:3px;font-family:'Inter';font-size:12.5px;">
           <button class="btn btn-primary btn-sm" id="pRunPayrollBtn">▶ Run This Month's Payroll &amp; Save</button>
+          <button class="btn btn-ghost btn-sm" id="pImportBtn" title="Import employees from an Excel/CSV sheet with First Name, Last Name, Branch, ID Number, Account Number, RSSB Number, and a column named for the payroll month (e.g. September) holding each person's take-home pay. Basic Salary is calculated automatically so Net Pay matches.">📥 Import Employees &amp; Salaries (Excel)</button>
+          <input type="file" id="pImportFile" accept=".csv,.xlsx,.xls" style="display:none;">
           <button class="btn btn-danger btn-sm" id="pClearAllBtn">Clear All Employees</button>
         </div>
       </div>
@@ -12374,6 +12518,15 @@ function wireViewEvents(){
       renderMain();
       alert(`Payroll for ${monthLabel(result.month+'-01')} saved: ${result.employeeCount} employee(s), Gross ${fmt(result.totals.gross)}, posted to the ledger.`);
     };
+    const importBtn = document.getElementById('pImportBtn');
+    const importFile = document.getElementById('pImportFile');
+    if(importBtn && importFile){
+      importBtn.onclick = ()=> importFile.click();
+      importFile.onchange = ()=>{
+        if(importFile.files && importFile.files[0]) handlePayrollImportFile(importFile.files[0]);
+        importFile.value = '';
+      };
+    }
   }
 
   // Customers / Vendors
