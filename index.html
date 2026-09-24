@@ -6804,6 +6804,47 @@ function buildHeaderMap(row){
 // Infer a reasonable account Type/Normal for an account name we've never seen
 // before, so imports from other systems don't get silently dropped just
 // because their account naming differs from this Chart of Accounts.
+// Returns '1300' or '2100' if this name clearly refers to Input or Output
+// VAT under different wording, or null if it's not a VAT account at all, or
+// too ambiguous to be sure (e.g. bare "VAT" with no input/output/payable/
+// receivable qualifier) — in which case it's left alone rather than guessed.
+function canonicalVatAccountCode(name){
+  const n = String(name||'').toLowerCase();
+  if(!/\bvat\b|\btax\b/.test(n)) return null;
+  const isInput = /\binput\b|\breceivable\b/.test(n);
+  const isOutput = /\boutput\b|\bpayable\b/.test(n);
+  if(isInput && !isOutput) return '1300';
+  if(isOutput && !isInput) return '2100';
+  return null;
+}
+// Any account, anywhere in the current Chart of Accounts, that should
+// really just be the existing 1300/2100 VAT account under a different
+// name — the residue of an import whose account-name spelling didn't
+// exact-match before this recognition existed.
+function findDuplicateVatAccounts(){
+  return state.accounts
+    .filter(a=> a.code!=='1300' && a.code!=='2100' && !!canonicalVatAccountCode(a.name))
+    .map(a=> ({...a, canonicalCode: canonicalVatAccountCode(a.name)}));
+}
+// One-time repair: moves every transaction on a duplicate VAT account onto
+// the real 1300/2100 account it was always meant to be. The now-empty
+// duplicate account definition is left in the Chart of Accounts (harmless,
+// just unused) rather than deleted, so nothing else that might reference
+// its code breaks.
+function fixDuplicateVatAccounts(){
+  const dupes = findDuplicateVatAccounts();
+  const fixed = [];
+  let totalMoved = 0;
+  dupes.forEach(d=>{
+    const stats = accountLineStats(d.code);
+    if(stats.count===0) return;
+    const moved = reassignAccountLines(d.code, d.canonicalCode);
+    totalMoved += moved;
+    fixed.push({code:d.code, name:d.name, canonicalCode:d.canonicalCode, moved});
+  });
+  return {fixed, totalMoved};
+}
+
 function inferAccountType(name){
   const n = name.toLowerCase();
   if(/fixed asset|equipment|vehicle|property|building|accumulated depreciation/.test(n)) return {type:'Asset', normal:'Debit', classification:'Non-Current'};
@@ -6822,6 +6863,11 @@ function findOrCreateAccountInList(accountsList, name, createdList){
   if(!clean) return null;
   let acct = accountsList.find(a=>a.name.toLowerCase()===clean.toLowerCase());
   if(acct) return acct;
+  const vatCode = canonicalVatAccountCode(clean);
+  if(vatCode){
+    const vatAcct = accountsList.find(a=>a.code===vatCode);
+    if(vatAcct) return vatAcct; // e.g. "Input VAT" / "output vat" / "VAT Payable" all resolve to the one real VAT account instead of splitting into a duplicate
+  }
   const inferred = inferAccountType(clean);
   let code = 9000;
   while(accountsList.some(a=>a.code===String(code))) code++;
@@ -10813,7 +10859,18 @@ function renderVATReport(){
   const payableBal = vatPayableBalance(vatPeriodTo);
   const claimedBal = vatClaimedBalance(vatPeriodTo);
   const inputBal = inputVATBalance(vatPeriodTo);
+  const vatDupes = findDuplicateVatAccounts().map(d=>({...d, stats:accountLineStats(d.code)})).filter(d=>d.stats.count>0);
   return `
+    ${vatDupes.length>0 ? `
+    <div class="ledger-panel" style="margin-bottom:18px;border-left:3px solid var(--ink-red,#a33);">
+      <div class="section-label" style="color:var(--ink-red,#a33);">⚠ VAT Is Sitting On The Wrong Account(s)</div>
+      <p style="font-size:13px;color:var(--text-soft);margin:0 0 12px;">
+        ${vatDupes.map(d=>`<strong>${esc(d.code)} — ${esc(d.name)}</strong> (${d.stats.count} line${d.stats.count===1?'':'s'}, ${fmt(Math.abs(d.stats.net))})`).join(', ')}
+        ${vatDupes.length===1?'looks like':'look like'} ${vatDupes.length===1?"it's":"they're"} really ${esc(acctName(vatDupes[0].canonicalCode))} under a different name — most likely from an import whose account name didn't exactly match what's already in your Chart of Accounts. The VAT Report only reads ${vatDupes.some(d=>d.canonicalCode==='1300')?'1300 (Input)':''}${vatDupes.some(d=>d.canonicalCode==='1300')&&vatDupes.some(d=>d.canonicalCode==='2100')?' and ':''}${vatDupes.some(d=>d.canonicalCode==='2100')?'2100 (Output)':''}, so this VAT is real, on your Balance Sheet, but invisible here until it's moved onto the right account.
+      </p>
+      <button class="btn btn-primary btn-sm" id="vatFixDupesBtn">🔧 Move to the Correct VAT Account</button>
+    </div>
+    ` : ''}
     <div class="field-row">
       <div class="field"><label>From</label><input type="date" id="vatFrom" value="${vatPeriodFrom}"></div>
       <div class="field"><label>To</label><input type="date" id="vatTo" value="${vatPeriodTo}"></div>
@@ -13131,6 +13188,15 @@ function wireViewEvents(){
       vatPeriodFrom = document.getElementById('vatFrom').value;
       vatPeriodTo = document.getElementById('vatTo').value;
       renderMain();
+    };
+    const vatFixDupesBtn = document.getElementById('vatFixDupesBtn');
+    if(vatFixDupesBtn) vatFixDupesBtn.onclick = ()=>{
+      const dupes = findDuplicateVatAccounts().map(d=>({...d, stats:accountLineStats(d.code)})).filter(d=>d.stats.count>0);
+      const summary = dupes.map(d=>`"${d.name}" → ${acctName(d.canonicalCode)} (${d.stats.count} line(s))`).join('\n');
+      if(!confirm(`Move VAT transactions onto the correct account?\n\n${summary}\n\nDates, memos, and amounts are unchanged — only the account each line hits will change. This cannot be undone.`)) return;
+      const result = fixDuplicateVatAccounts();
+      renderMain();
+      alert(`Moved ${result.totalMoved} transaction line(s) onto the correct VAT account(s). The VAT Report and Balance Sheet now agree.`);
     };
     const tourApply = document.getElementById('tourApply');
     if(tourApply) tourApply.onclick = ()=>{
