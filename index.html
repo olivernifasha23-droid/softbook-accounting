@@ -4037,6 +4037,28 @@ function recordInvoicePayment(invoiceId, amount, payTo, date){
   if(customer) customer.paid = (Number(customer.paid)||0) + amount;
   return true;
 }
+// One-time repair for the earlier bug where every recorded payment was
+// dated "today" instead of the invoice's own date. Re-dates the GL lines
+// posted under this invoice's payment entry, and its payments[] history,
+// to match the invoice's own date — leaving anything already correct
+// untouched.
+function fixInvoicePaymentDatesToInvoiceDate(){
+  let fixedInvoices = 0, fixedLines = 0;
+  (state.invoices||[]).forEach(inv=>{
+    if(!inv.date || !(Number(inv.paid)>0)) return;
+    const entryRef = inv.invoiceNo+'-PMT';
+    let touched = false;
+    state.gl.forEach(l=>{
+      if(l.entry===entryRef && l.date!==inv.date){ l.date = inv.date; fixedLines++; touched = true; }
+    });
+    if(Array.isArray(inv.payments)){
+      inv.payments.forEach(p=>{ if(p.date!==inv.date){ p.date = inv.date; touched = true; } });
+    }
+    if(touched) fixedInvoices++;
+  });
+  if(fixedInvoices>0) saveState();
+  return {fixedInvoices, fixedLines};
+}
 // Outstanding balance as of a specific date, not just today — used by the
 // Aged Debtors & Creditors report. Invoices raised after asAtDate simply
 // didn't exist yet, so they count as zero.
@@ -4115,6 +4137,25 @@ function billOutstandingAsAt(bill, asAtDate){
     return {amount: Number(bill.netPay)||0, approx:true};
   }
   return {amount: billOutstanding(bill), approx:false};
+}
+
+// Same repair as fixInvoicePaymentDatesToInvoiceDate, for bills.
+function fixBillPaymentDatesToBillDate(){
+  let fixedBills = 0, fixedLines = 0;
+  (state.bills||[]).forEach(bill=>{
+    if(!bill.date || !(Number(bill.paid)>0)) return;
+    const entryRef = (bill.entryRef||'BILL')+'-PMT';
+    let touched = false;
+    state.gl.forEach(l=>{
+      if(l.entry===entryRef && l.date!==bill.date){ l.date = bill.date; fixedLines++; touched = true; }
+    });
+    if(Array.isArray(bill.payments)){
+      bill.payments.forEach(p=>{ if(p.date!==bill.date){ p.date = bill.date; touched = true; } });
+    }
+    if(touched) fixedBills++;
+  });
+  if(fixedBills>0) saveState();
+  return {fixedBills, fixedLines};
 }
 
 function daysBetween(fromDateStr, toDateStr){
@@ -9249,6 +9290,7 @@ function renderAR(){
         <input type="text" id="arSearchInput" value="${esc(arSearchQuery)}" placeholder="🔎 Search by customer or invoice #…" style="flex:1;min-width:220px;padding:7px 9px;border:1px solid var(--rule-dk);border-radius:3px;font-family:'Inter';font-size:13px;">
         ${invoices.length>0?`<div style="display:flex;gap:8px;">
           ${open.length>0?`<button class="btn btn-primary btn-sm" id="arSaveAllBtn">💾 ${t('btn_saveall')}</button>`:''}
+          ${invoices.some(i=>Number(i.paid)>0)?`<button class="btn btn-ghost btn-sm" id="arFixPayDatesBtn" title="Re-dates every recorded payment to match its own invoice's date, undoing any that were posted using today's date instead">🗓 Fix Payment Dates</button>`:''}
           <button class="btn btn-danger btn-sm" id="arClearAllBtn">Clear All Invoices</button>
         </div>`:''}
       </div>
@@ -9339,6 +9381,7 @@ function renderAP(){
       <input type="text" id="apSearchInput" value="${esc(apSearchQuery)}" placeholder="🔎 Search by supplier or description…" style="width:100%;padding:7px 9px;margin-bottom:10px;border:1px solid var(--rule-dk);border-radius:3px;font-family:'Inter';font-size:13px;">
       ${bills.length>0?`<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
         ${open.length>0?`<button class="btn btn-primary btn-sm" id="apSaveAllBtn">💾 ${t('btn_saveall')}</button>`:''}
+        ${bills.some(b=>Number(b.paid)>0)?`<button class="btn btn-ghost btn-sm" id="apFixPayDatesBtn" title="Re-dates every recorded payment to match its own bill's date, undoing any that were posted using today's date instead">🗓 Fix Payment Dates</button>`:''}
         <label style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-soft);font-weight:600;">Clear from</label>
         <input type="date" id="apClearFrom" value="${apClearFrom}" style="border:1px solid var(--rule-dk);border-radius:3px;padding:5px 7px;font-family:'Inter';font-size:12.5px;">
         <label style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-soft);font-weight:600;">to</label>
@@ -11712,7 +11755,7 @@ function wireViewEvents(){
         if(target==='Fully Paid'){
           const remaining = billOutstanding(bill);
           if(remaining>0.005){
-            const ok = recordBillPayment(id, remaining, selectedPayAccount('data-pf-payacct', id), todayISO());
+            const ok = recordBillPayment(id, remaining, selectedPayAccount('data-pf-payacct', id), bill.date || todayISO());
             if(!ok){ alert('Could not record the remaining payment.'); return; }
           }
         } else if(target==='Partially Paid'){
@@ -11722,7 +11765,7 @@ function wireViewEvents(){
           if(amt<=0 || amt>=bill.netPay){ alert('Enter an amount greater than zero and less than the bill total.'); return; }
           const delta = amt - (Number(bill.paid)||0);
           if(delta>0){
-            const ok = recordBillPayment(id, delta, selectedPayAccount('data-pf-payacct', id), todayISO());
+            const ok = recordBillPayment(id, delta, selectedPayAccount('data-pf-payacct', id), bill.date || todayISO());
             if(!ok){ alert('Could not record that payment.'); return; }
           } else if(delta<0){
             alert('Reducing an already-recorded payment isn\'t supported here — delete the relevant entry in the General Ledger instead if it was recorded in error.');
@@ -11769,7 +11812,7 @@ function wireViewEvents(){
         } else if(target==='Fully Paid'){
           const remaining = invoiceOutstanding(inv);
           if(remaining>0.005){
-            const ok = recordInvoicePayment(id, remaining, selectedPayAccount('data-invoice-payacct', id), todayISO());
+            const ok = recordInvoicePayment(id, remaining, selectedPayAccount('data-invoice-payacct', id), inv.date || todayISO());
             if(!ok){ alert('Could not record the remaining payment.'); return; }
           }
         } else if(target==='Partially Paid'){
@@ -11779,7 +11822,7 @@ function wireViewEvents(){
           if(amt<=0 || amt>=inv.total){ alert('Enter an amount greater than zero and less than the invoice total.'); return; }
           const delta = amt - (Number(inv.paid)||0);
           if(delta>0){
-            const ok = recordInvoicePayment(id, delta, selectedPayAccount('data-invoice-payacct', id), todayISO());
+            const ok = recordInvoicePayment(id, delta, selectedPayAccount('data-invoice-payacct', id), inv.date || todayISO());
             if(!ok){ alert('Could not record that payment.'); return; }
           } else if(delta<0){
             alert('Reducing an already-recorded payment isn\'t supported here — delete the relevant entry in the General Ledger instead if it was recorded in error.');
@@ -11835,7 +11878,7 @@ function wireViewEvents(){
         if(!inv) return;
         const inputEl = document.querySelector(`[data-pay-amt-inv="${id}"]`);
         const amt = parseFloat(inputEl.value)||0;
-        const ok = recordInvoicePayment(id, amt, selectedPayAccount('data-pay-acct-inv', id), todayISO());
+        const ok = recordInvoicePayment(id, amt, selectedPayAccount('data-pay-acct-inv', id), inv.date || todayISO());
         if(!ok){ alert('Enter an amount greater than zero and no more than the outstanding balance.'); return; }
         saveState(); renderMain();
       };
@@ -11850,7 +11893,8 @@ function wireViewEvents(){
         const id = inp.getAttribute('data-pay-amt-inv');
         const amt = parseFloat(inp.value)||0;
         if(amt<=0){ skipped++; return; }
-        const ok = recordInvoicePayment(id, amt, selectedPayAccount('data-pay-acct-inv', id), todayISO());
+        const rowInv = state.invoices.find(i=>i.id===id);
+        const ok = recordInvoicePayment(id, amt, selectedPayAccount('data-pay-acct-inv', id), (rowInv && rowInv.date) || todayISO());
         if(ok) recorded++; else skipped++;
       });
       saveState(); renderMain();
@@ -11863,6 +11907,15 @@ function wireViewEvents(){
       if(!confirm(`Delete all ${invoices.length} invoice(s) and every ledger posting they made (revenue, VAT, payments received)? This also removes any matching entries mirrored into other companies' books, and cannot be undone.`)) return;
       [...invoices].forEach(inv=> deleteInvoiceEverywhere(inv.id));
       renderMain();
+    };
+    const arFixPayDatesBtn = document.getElementById('arFixPayDatesBtn');
+    if(arFixPayDatesBtn) arFixPayDatesBtn.onclick = ()=>{
+      if(!confirm('Re-date every recorded invoice payment to match its own invoice\'s date? This fixes payments that were posted using the date they happened to be entered instead of the invoice\'s actual date. Only mismatched entries are changed.')) return;
+      const result = fixInvoicePaymentDatesToInvoiceDate();
+      renderMain();
+      alert(result.fixedInvoices>0
+        ? `Fixed ${result.fixedLines} ledger line(s) across ${result.fixedInvoices} invoice(s).`
+        : 'Nothing to fix — every recorded payment already matches its invoice\'s date.');
     };
     document.querySelectorAll('[data-print-inv]').forEach(btn=>{
       btn.onclick = ()=> printInvoice(btn.getAttribute('data-print-inv'));
@@ -11913,6 +11966,15 @@ function wireViewEvents(){
       [...toDelete].forEach(b=> deleteProfessionalFeeBill(b.id));
       renderMain();
     };
+    const apFixPayDatesBtn = document.getElementById('apFixPayDatesBtn');
+    if(apFixPayDatesBtn) apFixPayDatesBtn.onclick = ()=>{
+      if(!confirm('Re-date every recorded bill payment to match its own bill\'s date? This fixes payments that were posted using the date they happened to be entered instead of the bill\'s actual date. Only mismatched entries are changed.')) return;
+      const result = fixBillPaymentDatesToBillDate();
+      renderMain();
+      alert(result.fixedBills>0
+        ? `Fixed ${result.fixedLines} ledger line(s) across ${result.fixedBills} bill(s).`
+        : 'Nothing to fix — every recorded payment already matches its bill\'s date.');
+    };
     document.querySelectorAll('[data-del-bill]').forEach(btn=>{
       btn.onclick = ()=>{
         const id = btn.getAttribute('data-del-bill');
@@ -11935,7 +11997,7 @@ function wireViewEvents(){
         if(!bill) return;
         const inputEl = document.querySelector(`[data-pay-amt-bill="${id}"]`);
         const amt = parseFloat(inputEl.value)||0;
-        const ok = recordBillPayment(id, amt, selectedPayAccount('data-pay-acct-bill', id), todayISO());
+        const ok = recordBillPayment(id, amt, selectedPayAccount('data-pay-acct-bill', id), bill.date || todayISO());
         if(!ok){ alert('Enter an amount greater than zero and no more than the outstanding balance.'); return; }
         saveState(); renderMain();
       };
@@ -11950,7 +12012,8 @@ function wireViewEvents(){
         const id = inp.getAttribute('data-pay-amt-bill');
         const amt = parseFloat(inp.value)||0;
         if(amt<=0){ skipped++; return; }
-        const ok = recordBillPayment(id, amt, selectedPayAccount('data-pay-acct-bill', id), todayISO());
+        const rowBill = state.bills.find(b=>b.id===id);
+        const ok = recordBillPayment(id, amt, selectedPayAccount('data-pay-acct-bill', id), (rowBill && rowBill.date) || todayISO());
         if(ok) recorded++; else skipped++;
       });
       saveState(); renderMain();
