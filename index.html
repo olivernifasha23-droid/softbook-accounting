@@ -4158,6 +4158,19 @@ function fixBillPaymentDatesToBillDate(){
   return {fixedBills, fixedLines};
 }
 
+function accountLineStats(code){
+  const lines = state.gl.filter(l=>l.account===code);
+  const debit = lines.reduce((s,l)=>s+(Number(l.debit)||0),0);
+  const credit = lines.reduce((s,l)=>s+(Number(l.credit)||0),0);
+  return {count: lines.length, debit, credit, net: debit-credit};
+}
+function reassignAccountLines(fromCode, toCode){
+  let count = 0;
+  state.gl.forEach(l=>{ if(l.account===fromCode){ l.account = toCode; count++; } });
+  if(count>0) saveState();
+  return count;
+}
+
 function daysBetween(fromDateStr, toDateStr){
   const a = new Date(fromDateStr+'T00:00:00'), b = new Date(toDateStr+'T00:00:00');
   return Math.round((b-a)/86400000);
@@ -6553,6 +6566,28 @@ function renderGL(){
     ` : ''}
 
     <div class="ledger-panel" style="margin-bottom:22px;">
+      <div class="section-label">Move Transactions Between Accounts</div>
+      <p style="font-size:13px;color:var(--text-soft);margin:0 0 12px;">
+        Everything currently posted to one account was actually coded to the wrong one (e.g. transactions landed in Cash &amp; Equivalents that should have hit a Bank account)? Move every one of those lines to the correct account in one go. Nothing about the dates, memos, or amounts changes — only which account each line hits.
+      </p>
+      <div class="field-row">
+        <div class="field" style="min-width:240px;"><label>From (currently wrong)</label>
+          <select id="glMoveFromAcct">
+            <option value="">Select account…</option>
+            ${state.accounts.map(a=>`<option value="${a.code}">${a.code} — ${esc(tAccountName(a.code, a.name))}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field" style="min-width:240px;"><label>To (correct account)</label>
+          <select id="glMoveToAcct">
+            <option value="">Select account…</option>
+            ${state.accounts.map(a=>`<option value="${a.code}">${a.code} — ${esc(tAccountName(a.code, a.name))}</option>`).join('')}
+          </select>
+        </div>
+        <button class="btn btn-primary" id="glMoveAcctBtn">Move Transactions</button>
+      </div>
+    </div>
+
+    <div class="ledger-panel" style="margin-bottom:22px;">
       ${editing ? renderGLEditForm(editing) : renderGLEntryBuilder()}
     </div>
 
@@ -7978,6 +8013,19 @@ function wireGLEvents(){
     renderMain();
     if(result.fixedGroups===0){ alert("Couldn't find clean balance points to split on — nothing was changed. This can happen if the merged lines don't cleanly divide into balanced transactions."); return; }
     alert(`Done — ${result.fixedGroups} merged entr${result.fixedGroups===1?'y was':'ies were'} split into ${result.newTransactions} separate transaction${result.newTransactions===1?'':'s'}.`);
+  };
+  const glMoveAcctBtn = document.getElementById('glMoveAcctBtn');
+  if(glMoveAcctBtn) glMoveAcctBtn.onclick = ()=>{
+    const fromCode = document.getElementById('glMoveFromAcct').value;
+    const toCode = document.getElementById('glMoveToAcct').value;
+    if(!fromCode || !toCode){ alert('Select both a "From" and a "To" account.'); return; }
+    if(fromCode===toCode){ alert('Pick two different accounts — this one is already the same on both sides.'); return; }
+    const stats = accountLineStats(fromCode);
+    if(stats.count===0){ alert(`${acctName(fromCode)} has no transactions to move.`); return; }
+    if(!confirm(`Move all ${stats.count} transaction line(s) currently posted to "${acctName(fromCode)}" (net ${fmt(stats.net)}) over to "${acctName(toCode)}"?\n\nDates, memos, and amounts are unchanged — only the account each line hits will change. This cannot be undone.`)) return;
+    const moved = reassignAccountLines(fromCode, toCode);
+    renderMain();
+    alert(`Moved ${moved} transaction line(s) from "${acctName(fromCode)}" to "${acctName(toCode)}".`);
   };
   const glApply = document.getElementById('glApplyDates');
   if(glApply) glApply.onclick = ()=>{
