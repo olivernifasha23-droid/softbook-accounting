@@ -3171,6 +3171,20 @@ function computeVATReport(from, to){
   return {outputVAT, inputVAT, net, payable: net>0, from, to};
 }
 
+// Human-readable label for a VAT period, shared by the Dashboard's VAT
+// Position tile and anywhere else that needs to describe a VAT date range
+// in the same words the Tax Management > VAT Report tab would use for it.
+function vatPeriodLabel(from, to){
+  const monthStartOfTo = (to||'').slice(0,8)+'01';
+  if(from===monthStartOfTo && to===todayISO()) return 'Month to Date';
+  if(from===monthStartOfTo && isLastDayOfMonth(to)) return monthLabelOf(to);
+  const d1 = new Date(String(from)+'T00:00:00');
+  const d2 = new Date(String(to)+'T00:00:00');
+  if(isNaN(d1) || isNaN(d2)) return `${from} – ${to}`;
+  const lang = (state && state.settings && state.settings.language==='fr') ? 'fr' : 'en';
+  return `${d1.toLocaleDateString(lang,{month:'short',day:'numeric'})} – ${d2.toLocaleDateString(lang,{month:'short',day:'numeric',year:'numeric'})}`;
+}
+
 /* ============================================================
    MONTH-END VAT CLOSING
    Nets Output VAT (2100) and Input VAT (1300) for a filing period into
@@ -5469,7 +5483,12 @@ function renderDashboard(){
   const bs = computeBalanceSheet(asOfDate);
   const monthStart = asOfDate.slice(0,8)+'01';
   const pl = computePL(monthStart, asOfDate);
-  const vat = computeVATReport(monthStart, asOfDate);
+  // Always read the SAME period Tax Management > VAT Report is using
+  // (vatPeriodFrom/vatPeriodTo), not a separately-derived date range —
+  // otherwise this tile and that tab can silently drift apart (e.g. if
+  // the Balance Sheet "as of" date was changed) and show different VAT
+  // numbers for what looks like the same period.
+  const vat = computeVATReport(vatPeriodFrom, vatPeriodTo);
   const recent = [...state.gl].sort((a,b)=> (b.date||'').localeCompare(a.date||'')).slice(0,8);
   const cashBalance = sumAccount('1000', null, asOfDate, 'net') + sumAccount('1010', null, asOfDate, 'net');
   const totalAR = sumAccount('1100', null, asOfDate, 'net');
@@ -5534,9 +5553,10 @@ function renderDashboard(){
         <span class="badge ${bs.balanced?'ok':'bad'}">${bs.balanced ? 'In balance' : 'Out of balance by '+fmt(Math.abs(bs.totalAssets-bs.totalLiabEquity))}</span>
       </div>
       <div class="ledger-panel">
-        <div class="section-label">VAT Position (Month to Date)</div>
+        <div class="section-label">VAT Position (${esc(vatPeriodLabel(vatPeriodFrom, vatPeriodTo))})</div>
         <p style="font-size:13px;margin:0 0 4px;">Output VAT <span class="num">${fmt(vat.outputVAT)}</span> − Input VAT <span class="num">${fmt(vat.inputVAT)}</span></p>
         <span class="badge ${vat.net>=0?'pending':'ok'}">${vat.net>=0 ? 'Payable '+fmt(vat.net) : 'Refundable '+fmt(Math.abs(vat.net))}</span>
+        <p style="font-size:11px;color:var(--text-soft);margin:6px 0 0;">Same period as Tax Management → VAT Report</p>
       </div>
     </div>
 
