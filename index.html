@@ -7658,64 +7658,27 @@ function parseBankStatementFile(rows, headerMap){
 // PDF path for Bank Statement Import — separate from the CSV/Excel path
 // above, and deliberately NOT sharing code with the existing PDF
 // extraction used by Bank Reconciliation (extractBankStatementFromPDF),
-// so this can't ever regress that already-working feature. Reuses the
-// same underlying pdf.js text-extraction technique and the same
-// parseBankStatementText() line parser, since that part is already
-// proven — but wraps it with a genuine check for scanned/image PDFs
-// (rejected outright, since guessing at those would silently produce
-// garbage) and tags every resulting row as PDF-extracted, since text
-// pulled from a PDF's visual layout is inherently less reliable than a
-// real CSV/Excel column and deserves closer review before posting.
-async function extractRawTextFromPdf(file){
-  if(typeof pdfjsLib === 'undefined'){
-    throw new Error('PDF library did not load — check your internet connection and reload the page.');
-  }
-  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
-  let fullText = '';
-  for(let i=1; i<=pdf.numPages; i++){
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const rows = {};
-    content.items.forEach(item=>{
-      const y = Math.round(item.transform[5]);
-      if(!rows[y]) rows[y] = [];
-      rows[y].push({x:item.transform[4], str:item.str});
-    });
-    const sortedY = Object.keys(rows).map(Number).sort((a,b)=>b-a);
-    sortedY.forEach(y=>{
-      const rowText = rows[y].sort((a,b)=>a.x-b.x).map(f=>f.str).join(' ');
-      fullText += rowText + '\n';
-    });
-  }
-  return fullText;
-}
+// so this can't ever regress that already-working feature. Wraps its own
+// pdf.js text extraction (extractPdfRowsForBankImport, further below)
+// with a genuine check for scanned/image PDFs (rejected outright, since
+// guessing at those would silently produce garbage) and tags every
+// resulting row as PDF-extracted, since text pulled from a PDF's visual
+// layout is inherently less reliable than a real CSV/Excel column and
+// deserves closer review before posting.
 
-// Dedicated parser for Bank Statement Import — deliberately separate
-// from the shared parseBankStatementText() used by Bank Reconciliation,
-// whose logic (first numeric token on the line, positive unless
-// parenthesized) breaks on the extremely common statement layout with
-// explicit "0.00" in the unused Debit or Credit column: it would pick up
-// that zero as "the amount" and silently drop the real one that follows.
-// This version collects every numeric token on the line and always
-// treats the LAST number as the running Balance (virtually every real
-// statement layout ends each line with one) before interpreting whatever
-// comes before it:
-//   - two numbers left over (3 total) → separate Debit/Credit columns,
-//     in that order — whichever one is actually nonzero is the real
-//     transaction (the common layout for e.g. this app's USD statements).
-//   - one number left over (2 total) → a single signed Amount column
-//     with no separate Debit/Credit split — its sign (a leading "-" or
-//     parentheses, via parseAmountToken) says whether it's money out or
-//     in (the common layout for e.g. RWF statements from RWF banks).
-// Previously, the 2-numbers case was wrongly treated as [Debit, Credit]
-// instead of [Amount, Balance] — which silently posted every transaction
-// as "money in" using the running BALANCE as the amount, since Balance
-// almost always reads as a positive number. Every row this produces is
-// still flagged fromPdf for manual review, since a column-order
-// assumption like this is exactly the kind of thing worth a human
-// double-check on an unfamiliar bank's layout.
+// Text-only fallback for Bank Statement Import PDFs — used only when
+// parseBankStatementRowsForImport (below) can't find a Debit/Credit
+// header on the page to anchor column positions to. Collects every
+// numeric token on the line and always treats the LAST one as the
+// running Balance (virtually every real statement layout ends each line
+// with one) before interpreting whatever comes before it: two numbers
+// left over means separate Debit/Credit columns (whichever is nonzero is
+// the real transaction); one number left over means a single signed
+// Amount column, where a leading "-" or parentheses says debit vs
+// credit. This is a last resort — parseBankStatementRowsForImport's
+// column-position matching is far more reliable whenever a header row is
+// present, since it reads the actual Debit/Credit column each figure sits
+// under instead of guessing from how many numbers appear on the line.
 function parseBankStatementTextForImport(rawText){
   const lines = String(rawText||'').split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
   const dateRegex = /^(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/;
@@ -7756,8 +7719,122 @@ function parseBankStatementTextForImport(rawText){
   return transactions;
 }
 
+// Primary parser for Bank Statement Import PDFs — works from the actual
+// per-page rows (each row: text fragments with their x position on the
+// page, as pdf.js reports them) rather than flattened text, so it can
+// read a genuine Debit column and a genuine Credit column exactly like a
+// human would: by WHERE each figure sits on the page, never by counting
+// how many numbers appear on the line or guessing from a plus/minus sign.
+// This is what makes a statement whose unused Debit/Credit cell is left
+// truly blank (common on RWF bank statements) behave exactly like one
+// that prints an explicit "0.00" there (common on USD statements): either
+// way, whichever figure sits under the Debit header is money out, and
+// whichever sits under the Credit header is money in — the running
+// Balance column is identified and ignored the same way, by position,
+// never mistaken for a transaction amount.
+// Falls back to the text-only heuristic above only when no row on the
+// page names both a Debit/Withdrawal and a Credit/Deposit column, since
+// then there's no column position to anchor to.
+function parseBankStatementRowsForImport(pageRows){
+  const dateRegex = /^(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/;
+  const amountRegex = /\(?-?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?\)?|\(?-?\d+\.\d{1,2}\)?/g;
+
+  let debitX=null, creditX=null, balanceX=null;
+  for(const row of pageRows){
+    let fd=null, fc=null, fb=null;
+    row.forEach(tok=>{
+      const s = String(tok.str).toLowerCase();
+      if(fd==null && /\b(debit|withdrawal|withdrawals)\b/.test(s)) fd = tok.x;
+      if(fc==null && /\b(credit|deposit|deposits)\b/.test(s)) fc = tok.x;
+      if(fb==null && /\bbalance\b/.test(s)) fb = tok.x;
+    });
+    if(fd!=null && fc!=null){ debitX=fd; creditX=fc; balanceX=fb; break; }
+  }
+
+  if(debitX==null || creditX==null){
+    const flatText = pageRows.map(row=>row.map(f=>f.str).join(' ')).join('\n');
+    return parseBankStatementTextForImport(flatText);
+  }
+
+  const transactions = [];
+  pageRows.forEach(row=>{
+    // Rebuild the row's text while tracking which x position each
+    // character came from, so a regex match found in the text can still
+    // be traced back to the column it sits under.
+    let rowText = '';
+    const offsetToX = [];
+    row.forEach((tok, i)=>{
+      if(i>0){ rowText += ' '; offsetToX.push(tok.x); }
+      const s = String(tok.str);
+      for(let c=0;c<s.length;c++) offsetToX.push(tok.x);
+      rowText += s;
+    });
+
+    const dateMatch = rowText.match(dateRegex);
+    if(!dateMatch) return;
+    const dateStr = parseImportedDate(dateMatch[1]);
+    if(!dateStr) return;
+    let restStart = dateMatch[0].length;
+    const afterDate = rowText.slice(restStart);
+    const leadingWs = afterDate.length - afterDate.trimStart().length;
+    const valueDateMatch = afterDate.trimStart().match(dateRegex);
+    if(valueDateMatch) restStart += leadingWs + valueDateMatch[0].length;
+    const rest = rowText.slice(restStart);
+
+    const amountMatches = [...rest.matchAll(amountRegex)];
+    if(amountMatches.length===0) return;
+    const figures = amountMatches.map(m=>({
+      val: parseAmountToken(m[0]),
+      x: offsetToX[restStart + m.index] != null ? offsetToX[restStart + m.index] : 0,
+    }));
+    const description = (amountMatches[0].index>0 ? rest.slice(0, amountMatches[0].index) : '').trim() || 'Transaction';
+
+    let debit=0, credit=0;
+    figures.forEach(({val,x})=>{
+      const dDebit=Math.abs(x-debitX), dCredit=Math.abs(x-creditX);
+      const dBalance = balanceX!=null ? Math.abs(x-balanceX) : Infinity;
+      if(dBalance<=dDebit && dBalance<=dCredit) return; // sits under the Balance column — ignore
+      if(dDebit<=dCredit) debit=val; else credit=val;
+    });
+    if(credit>0) transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(credit), direction:'credit'});
+    else if(debit>0) transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(debit), direction:'debit'});
+  });
+  return transactions;
+}
+
+// Reads a statement PDF's text AND each fragment's page position (pdf.js
+// reports both), grouped into rows by y-coordinate and sorted left to
+// right — feeds parseBankStatementRowsForImport, which needs the real
+// column positions, and (flattened to plain text) the scanned/image-PDF
+// check in parseBankStatementPdf below.
+async function extractPdfRowsForBankImport(file){
+  if(typeof pdfjsLib === 'undefined'){
+    throw new Error('PDF library did not load — check your internet connection and reload the page.');
+  }
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+  const allRows = [];
+  for(let i=1; i<=pdf.numPages; i++){
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const rowsByY = {};
+    content.items.forEach(item=>{
+      const y = Math.round(item.transform[5]);
+      if(!rowsByY[y]) rowsByY[y] = [];
+      rowsByY[y].push({x:item.transform[4], str:item.str});
+    });
+    const sortedY = Object.keys(rowsByY).map(Number).sort((a,b)=>b-a);
+    sortedY.forEach(y=>{
+      allRows.push(rowsByY[y].sort((a,b)=>a.x-b.x));
+    });
+  }
+  return allRows;
+}
+
 async function parseBankStatementPdf(file){
-  const fullText = await extractRawTextFromPdf(file);
+  const rows = await extractPdfRowsForBankImport(file);
+  const fullText = rows.map(row=>row.map(f=>f.str).join(' ')).join('\n');
   // A digitally-generated statement PDF yields a substantial amount of
   // real text; a scanned/photographed one yields little to nothing,
   // since there's no actual text layer to extract — just an image. This
@@ -7767,7 +7844,7 @@ async function parseBankStatementPdf(file){
   if(fullText.trim().length < 100){
     return {error: 'This looks like a scanned or photographed PDF — there\'s no readable text in it to extract. Only digitally-generated statement PDFs (the kind your bank emails or exports directly, not a scan of a printed copy) can be read automatically. Please upload the original digital PDF, or export as CSV/Excel from your bank instead.'};
   }
-  const parsed = parseBankStatementTextForImport(fullText);
+  const parsed = parseBankStatementRowsForImport(rows);
   const staged = parsed.map(t=>({
     id: t.id, date: t.date, description: t.description,
     amount: t.amount, direction: t.direction,
