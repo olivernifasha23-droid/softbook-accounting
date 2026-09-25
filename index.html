@@ -3071,6 +3071,29 @@ function computePayrollRow(emp, forDate){
   return {gross, paye, pension, maternity, cbhi, totalDed, net, erPension, erMaternity, erOccHazard, erTotal, pensionPayable, maternityPayable, mealReimb, transportReimb, totalReimb, consultFee, totalPaidUp};
 }
 
+// Wraps computePayrollRow with one policy: an employee with no RSSB Number
+// on file has nowhere for a Pension/Maternity/CBHI contribution to be
+// remitted to, so none of it is actually owed or set aside for them —
+// they're simply paid their full computed Net Pay, in cash, with no
+// PAYE/Pension/Maternity/CBHI payable and no employer contribution
+// attributed to them anywhere payroll totals are added up (the Payroll
+// Accounts Recording and Payment/Transfer Summary cards, the Monthly
+// Payroll list, the Excel export, and the actual GL postings when payroll
+// is run). Net Pay itself never changes for anyone — this only removes the
+// otherwise-theoretical statutory breakdown for someone who was never
+// actually enrolled with RSSB, and its Gross also collapses to match Net
+// so the books still balance without a phantom liability being recorded.
+function effectivePayrollCalc(emp, forDate){
+  const calc = computePayrollRow(emp, forDate);
+  if(emp && String(emp.rssbNumber||'').trim()) return calc;
+  return {
+    ...calc,
+    gross: calc.net, paye: 0, pension: 0, maternity: 0, cbhi: 0, totalDed: 0,
+    erPension: 0, erMaternity: 0, erOccHazard: 0, erTotal: 0,
+    pensionPayable: 0, maternityPayable: 0,
+  };
+}
+
 // Posts the monthly payroll journal entry for whichever employees are
 // currently ticked "Worked this month" — gross salary and the employer's
 // own RSSB contribution both land as expenses, while PAYE, RSSB (employee
@@ -3082,7 +3105,7 @@ function runMonthlyPayroll(month){
   if(ticked.length===0) return {ok:false, msg:'No employees are ticked as having worked this month.'};
 
   const totals = ticked.reduce((s,e)=>{
-    const c = computePayrollRow(e, month+'-01');
+    const c = effectivePayrollCalc(e, month+'-01');
     return {
       gross: s.gross+c.gross, paye: s.paye+c.paye,
       pensionEmp: s.pensionEmp+c.pension, maternityEmp: s.maternityEmp+c.maternity, cbhi: s.cbhi+c.cbhi,
@@ -3140,7 +3163,7 @@ function runMonthlyPayroll(month){
   // the Payroll page shows THIS data for that month instead of recomputing
   // live from the current employee roster — so editing or deleting an
   // employee afterward never changes a month that's already been run.
-  const employeeSnapshot = ticked.map(e=>({...e, calc: computePayrollRow(e, month+'-01')}));
+  const employeeSnapshot = ticked.map(e=>({...e, calc: effectivePayrollCalc(e, month+'-01')}));
   state.payrollRuns.push({id:uid(), month, date, entryRef, employeeCount: ticked.length, employees: employeeSnapshot, ...totals});
   saveState();
   return {ok:true, month, totals, employeeCount: ticked.length};
@@ -8828,7 +8851,7 @@ function renderPayroll(){
   const isLocked = !!(alreadyRun && alreadyRun.employees && alreadyRun.employees.length);
   const rows = isLocked
     ? alreadyRun.employees.map(e=>({...e}))
-    : state.payroll.map(e=>({...e, calc: computePayrollRow(e, payrollRunMonth+'-01')}));
+    : state.payroll.map(e=>({...e, calc: effectivePayrollCalc(e, payrollRunMonth+'-01')}));
   const totals = rows.reduce((s,r)=>({
     gross:s.gross+r.calc.gross, paye:s.paye+r.calc.paye, pension:s.pension+r.calc.pension,
     maternity:s.maternity+r.calc.maternity, cbhi:s.cbhi+r.calc.cbhi, net:s.net+r.calc.net
@@ -10067,7 +10090,7 @@ function exportPayrollToExcel(){
   if(state.payroll.length===0){ alert('No employees to export.'); return; }
   const c = state.settings.company;
   const monthRef = (payrollRunMonth || todayISO().slice(0,7)) + '-01';
-  const rows = state.payroll.map(e=>({...e, calc: computePayrollRow(e, monthRef)}));
+  const rows = state.payroll.map(e=>({...e, calc: effectivePayrollCalc(e, monthRef)}));
   const totals = rows.reduce((s,r)=>({
     gross:s.gross+r.calc.gross, paye:s.paye+r.calc.paye, pension:s.pension+r.calc.pension,
     maternity:s.maternity+r.calc.maternity, cbhi:s.cbhi+r.calc.cbhi, net:s.net+r.calc.net,
