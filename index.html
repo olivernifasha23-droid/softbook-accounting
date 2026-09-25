@@ -7698,12 +7698,23 @@ async function extractRawTextFromPdf(file){
 // parenthesized) breaks on the extremely common statement layout with
 // explicit "0.00" in the unused Debit or Credit column: it would pick up
 // that zero as "the amount" and silently drop the real one that follows.
-// This version collects every numeric token on the line, drops a
-// trailing running-Balance figure when 3+ numbers are present, and reads
-// the remaining two as Debit then Credit (the standard column order) —
-// whichever one is actually nonzero is the real transaction. Every row
-// this produces is still flagged fromPdf for manual review, since this
-// column-order assumption is exactly the kind of thing worth a human
+// This version collects every numeric token on the line and always
+// treats the LAST number as the running Balance (virtually every real
+// statement layout ends each line with one) before interpreting whatever
+// comes before it:
+//   - two numbers left over (3 total) → separate Debit/Credit columns,
+//     in that order — whichever one is actually nonzero is the real
+//     transaction (the common layout for e.g. this app's USD statements).
+//   - one number left over (2 total) → a single signed Amount column
+//     with no separate Debit/Credit split — its sign (a leading "-" or
+//     parentheses, via parseAmountToken) says whether it's money out or
+//     in (the common layout for e.g. RWF statements from RWF banks).
+// Previously, the 2-numbers case was wrongly treated as [Debit, Credit]
+// instead of [Amount, Balance] — which silently posted every transaction
+// as "money in" using the running BALANCE as the amount, since Balance
+// almost always reads as a positive number. Every row this produces is
+// still flagged fromPdf for manual review, since a column-order
+// assumption like this is exactly the kind of thing worth a human
 // double-check on an unfamiliar bank's layout.
 function parseBankStatementTextForImport(rawText){
   const lines = String(rawText||'').split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
@@ -7722,12 +7733,25 @@ function parseBankStatementTextForImport(rawText){
     const valueDateMatch = rest.match(dateRegex);
     if(valueDateMatch) rest = rest.slice(valueDateMatch[0].length).trim();
     const amountMatches = [...rest.matchAll(amountRegex)];
-    if(amountMatches.length < 2) return; // need at least Debit and Credit tokens to tell them apart
+    if(amountMatches.length < 2) return; // need at least an Amount and a running Balance to tell them apart
     const nums = amountMatches.map(m=>parseAmountToken(m[0]));
-    const [debit, credit] = nums.length>=3 ? nums.slice(-3,-1) : nums.slice(0,2);
+    // Drop the trailing running-Balance figure — always the last number —
+    // and interpret whatever's left.
+    const remaining = nums.slice(0, -1);
     const description = (rest.indexOf(amountMatches[0][0])>0 ? rest.slice(0, rest.indexOf(amountMatches[0][0])) : '').trim() || 'Transaction';
-    if(credit > 0) transactions.push({id:uid(), date:dateStr, description, amount:credit, direction:'credit'});
-    else if(debit > 0) transactions.push({id:uid(), date:dateStr, description, amount:debit, direction:'debit'});
+    if(remaining.length>=2){
+      // Separate Debit/Credit columns (take the last two before Balance,
+      // in case an extra number slipped in earlier on the line).
+      const [debit, credit] = remaining.slice(-2);
+      if(credit > 0) transactions.push({id:uid(), date:dateStr, description, amount:credit, direction:'credit'});
+      else if(debit > 0) transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(debit), direction:'debit'});
+    } else if(remaining.length===1){
+      // A single signed Amount column — its sign says the direction, not
+      // its position, and never the Balance that follows it.
+      const amt = remaining[0];
+      if(amt===0) return;
+      transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(amt), direction: amt>0 ? 'credit' : 'debit'});
+    }
   });
   return transactions;
 }
