@@ -679,6 +679,35 @@ function loadState(){
       })
     });
     purgePostedBankStaging(normalizedClient);
+    // One-time cleanup: an earlier version of this app posted the bank
+    // transfer charges INSIDE the main payroll entry, sharing its
+    // 'PAYROLL-<month>' reference, instead of on their own dedicated one.
+    // Any client whose data still carries a pair of lines like that needs
+    // them handled before the self-heal sync below runs — otherwise the
+    // sync (which only recognizes its own 'PAYROLL-TRANSFER-<month>'
+    // reference) wouldn't know a charge was already posted under the old
+    // one, and would post a second, duplicate Bank Charges entry right on
+    // top of it.
+    Object.keys(normalizedClient.payrollTransfers || {}).forEach(month=>{
+      const oldRef = 'PAYROLL-'+month, newRef = 'PAYROLL-TRANSFER-'+month;
+      const isBankChargeLine = l => l.account==='5950' || (()=>{
+        const a = normalizedClient.accounts.find(a=>a.code===l.account);
+        return a && a.name==='Bank Charges Payable';
+      })();
+      const oldLines = normalizedClient.gl.filter(l=>l.entry===oldRef && isBankChargeLine(l));
+      if(!oldLines.length) return;
+      if(normalizedClient.gl.some(l=>l.entry===newRef)){
+        // The charge already exists correctly under the new, dedicated
+        // reference too — this is the duplicate itself. Drop the old,
+        // no-longer-used copy so it isn't counted twice.
+        normalizedClient.gl = normalizedClient.gl.filter(l=>!oldLines.includes(l));
+      } else {
+        // No new-ref lines yet — this old pair IS the original, correct
+        // posting from before this update; just move it onto the new
+        // dedicated reference instead of posting a second copy of it.
+        oldLines.forEach(l=>{ l.entry = newRef; });
+      }
+    });
     // Self-heal: post (or re-sync) Bank Charges for every month that has a
     // Transfer Charge on record, no matter when it was entered relative to
     // that month's payroll run. This is what catches a month whose payroll
