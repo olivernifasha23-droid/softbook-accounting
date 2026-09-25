@@ -564,6 +564,53 @@ function purgePostedBankStaging(st){
   return before - st.bankStaging.length;
 }
 
+// Keeps a given month's Payment/Transfer Summary "Transfer Charge" figures
+// in sync with the ledger as a Bank Charges expense/payable — completely
+// independent of whether that month's payroll has already been run. In
+// practice the bank doesn't charge its transfer fee until the payment
+// actually goes out, so the normal order of events is: run payroll first,
+// then fill in the Transfer Charge afterward. This function is safe to
+// call as often as needed (it removes its own prior lines and re-posts
+// fresh ones each time under a dedicated 'PAYROLL-TRANSFER-<month>' entry
+// reference, separate from the main payroll entry), so it never duplicates
+// and never drifts out of sync — and it runs against a plain client object
+// rather than only the live `state`, so it can also self-heal any client's
+// saved data the moment it's loaded (see its call inside loadState below),
+// which is what recovers already-entered transfer charges that were typed
+// in after a month's payroll was run under an older version of this app
+// that didn't yet know how to post them. Pass `onlyMonth` to sync just one
+// month (used right after the user edits it); omit it to sweep every month
+// on record (used at load time).
+function syncPayrollTransferChargesInClient(client, onlyMonth){
+  if(!client || !Array.isArray(client.gl) || !Array.isArray(client.accounts)) return;
+  const transfers = client.payrollTransfers || {};
+  const months = onlyMonth ? [onlyMonth] : Object.keys(transfers);
+  months.forEach(month=>{
+    const parts = /^(\d{4})-(\d{2})$/.exec(month);
+    if(!parts) return;
+    const tr = transfers[month] || {};
+    const transferCharge = (parseFloat(tr.netCharge)||0) + (parseFloat(tr.payeCharge)||0) + (parseFloat(tr.pensionCharge)||0) + (parseFloat(tr.maternityCharge)||0) + (parseFloat(tr.cbhiCharge)||0);
+    const entryRef = 'PAYROLL-TRANSFER-'+month;
+    const existingLines = client.gl.filter(l=>l.entry===entryRef);
+    const existingTotal = existingLines.reduce((s,l)=>s+(l.debit||0),0);
+    // Already posted and matches what's currently entered — nothing to do,
+    // so re-normalizing on every load doesn't touch the GL when nothing changed.
+    if(Math.abs(existingTotal - transferCharge) < 0.5 && (existingLines.length>0) === (transferCharge>0.5)) return;
+    // Otherwise clear out whatever was posted before and re-post fresh, so
+    // editing a transfer charge (or clearing it back to zero) is always
+    // reflected exactly, with no leftover or duplicate lines.
+    client.gl = client.gl.filter(l=>l.entry!==entryRef);
+    if(transferCharge>0.5){
+      const y = Number(parts[1]), mo = Number(parts[2]);
+      const date = ymd(new Date(y, mo, 0)); // same month-end date runMonthlyPayroll dates its own entry to
+      const bankChargeExpAcct = client.accounts.find(a=>a.code==='5950') || findOrCreateAccountInList(client.accounts, 'Bank Charges');
+      const bankChargePayAcct = findOrCreateAccountInList(client.accounts, 'Bank Charges Payable');
+      client.gl.push({id:uid(), date, entry:entryRef, account:bankChargeExpAcct.code, memo:`Payroll ${month} — Bank Transfer Charges`, debit:transferCharge, credit:0});
+      client.gl.push({id:uid(), date, entry:entryRef, account:bankChargePayAcct.code, memo:`Payroll ${month} — Bank Transfer Charges Payable`, debit:0, credit:transferCharge});
+    }
+  });
+}
+
 function loadState(){
   // normalizes any client-shaped object to survive schema additions between versions
   return function(parsed){
@@ -632,6 +679,14 @@ function loadState(){
       })
     });
     purgePostedBankStaging(normalizedClient);
+    // Self-heal: post (or re-sync) Bank Charges for every month that has a
+    // Transfer Charge on record, no matter when it was entered relative to
+    // that month's payroll run. This is what catches a month whose payroll
+    // was already run and saved before this feature existed, and whose
+    // transfer charges were only filled in afterward — the very next time
+    // this client's data loads, those charges land on the books on their
+    // own, with no need to re-run (and risk duplicating) that payroll.
+    syncPayrollTransferChargesInClient(normalizedClient);
     return normalizedClient;
   };
 }
@@ -3164,15 +3219,15 @@ function runMonthlyPayroll(month){
   // money the company spends getting payroll paid out, so it belongs on
   // the Income Statement as a Bank Charges expense the same month, with
   // the amount owed sitting as a payable until settled, exactly like every
-  // other cost above.
+  // other cost above. It's posted through its own dedicated, self-syncing
+  // entry (syncPayrollTransferChargesInClient) rather than folded into this
+  // one, since in practice the transfer fee is usually only known AFTER
+  // payroll has already been run and saved — that way, filling it in later
+  // still gets recorded without needing to re-run (and risk duplicating)
+  // this whole payroll entry.
   const tr = (state.payrollTransfers && state.payrollTransfers[month]) || {};
   const transferCharge = (parseFloat(tr.netCharge)||0) + (parseFloat(tr.payeCharge)||0) + (parseFloat(tr.pensionCharge)||0) + (parseFloat(tr.maternityCharge)||0) + (parseFloat(tr.cbhiCharge)||0);
-  if(transferCharge>0){
-    const bankChargeExpAcct = state.accounts.find(a=>a.code==='5950') || findOrCreateAccountByName('Bank Charges');
-    const bankChargePayAcct = findOrCreateAccountByName('Bank Charges Payable');
-    state.gl.push({id:uid(), date, entry:entryRef, account:bankChargeExpAcct.code, memo:`Payroll ${month} — Bank Transfer Charges`, debit:transferCharge, credit:0});
-    state.gl.push({id:uid(), date, entry:entryRef, account:bankChargePayAcct.code, memo:`Payroll ${month} — Bank Transfer Charges Payable`, debit:0, credit:transferCharge});
-  }
+  syncPayrollTransferChargesInClient(state, month);
 
   state.payrollRuns = state.payrollRuns || [];
   // Snapshot each ticked employee's full record + that month's calculated
@@ -12701,6 +12756,7 @@ function wireViewEvents(){
         if(!state.payrollTransfers) state.payrollTransfers = {};
         if(!state.payrollTransfers[payrollRunMonth]) state.payrollTransfers[payrollRunMonth] = {};
         state.payrollTransfers[payrollRunMonth][field] = (field==='status') ? inp.value : (parseFloat(inp.value)||0);
+        if(field!=='status') syncPayrollTransferChargesInClient(state, payrollRunMonth);
         saveState(); renderMain();
       };
     });
