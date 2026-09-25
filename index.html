@@ -7732,12 +7732,26 @@ function parseBankStatementTextForImport(rawText){
 // whichever sits under the Credit header is money in — the running
 // Balance column is identified and ignored the same way, by position,
 // never mistaken for a transaction amount.
+// Each fragment pdf.js hands back already carries its own on-page x
+// position, so figures are matched one fragment at a time against the
+// Debit/Credit/Balance column positions — never by scanning a shared
+// block of row text — which is what lets a small, plainly-printed figure
+// like a 50 RWF bank charge (no comma grouping, no decimal point) be
+// recognized as a real amount: it's still told apart from an unrelated
+// bare-integer reference number (a Tran Id or Cheque ID) because that
+// number sits in a different column, further from every known amount
+// column than the tolerance below allows.
 // Falls back to the text-only heuristic above only when no row on the
 // page names both a Debit/Withdrawal and a Credit/Deposit column, since
 // then there's no column position to anchor to.
 function parseBankStatementRowsForImport(pageRows){
-  const dateRegex = /^(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/;
-  const amountRegex = /\(?-?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?\)?|\(?-?\d+\.\d{1,2}\)?/g;
+  const dateRegex = /^(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})$/;
+  // A figure can be comma-grouped and/or carry a decimal (12,000.00) or
+  // be a completely bare integer (50) — accepting the bare form is safe
+  // here because it's checked against its OWN fragment and x position,
+  // not against a shared line of text where a bare number could be
+  // anything.
+  const amountTokenRegex = /^\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\)?$/;
 
   let debitX=null, creditX=null, balanceX=null;
   for(const row of pageRows){
@@ -7756,48 +7770,54 @@ function parseBankStatementRowsForImport(pageRows){
     return parseBankStatementTextForImport(flatText);
   }
 
+  // How close a numeric fragment must sit to a known amount column to be
+  // trusted as belonging to it — half the gap between the known columns
+  // themselves, so a reference number in some other column (Tran Id,
+  // Cheque ID, ...) sitting a full column-width away is never close
+  // enough to be pulled in, while ordinary column-alignment jitter in a
+  // real Debit/Credit/Balance figure still is.
+  const knownX = [debitX, creditX, balanceX].filter(x=>x!=null).sort((a,b)=>a-b);
+  let minGap = Infinity;
+  for(let i=1;i<knownX.length;i++) minGap = Math.min(minGap, knownX[i]-knownX[i-1]);
+  const TOLERANCE = (isFinite(minGap) && minGap>0) ? minGap/2 : 40;
+
   const transactions = [];
   pageRows.forEach(row=>{
-    // Rebuild the row's text while tracking which x position each
-    // character came from, so a regex match found in the text can still
-    // be traced back to the column it sits under.
-    let rowText = '';
-    const offsetToX = [];
-    row.forEach((tok, i)=>{
-      if(i>0){ rowText += ' '; offsetToX.push(tok.x); }
-      const s = String(tok.str);
-      for(let c=0;c<s.length;c++) offsetToX.push(tok.x);
-      rowText += s;
-    });
-
-    const dateMatch = rowText.match(dateRegex);
+    if(!row.length) return;
+    const dateMatch = String(row[0].str).trim().match(dateRegex);
     if(!dateMatch) return;
     const dateStr = parseImportedDate(dateMatch[1]);
     if(!dateStr) return;
-    let restStart = dateMatch[0].length;
-    const afterDate = rowText.slice(restStart);
-    const leadingWs = afterDate.length - afterDate.trimStart().length;
-    const valueDateMatch = afterDate.trimStart().match(dateRegex);
-    if(valueDateMatch) restStart += leadingWs + valueDateMatch[0].length;
-    const rest = rowText.slice(restStart);
 
-    const amountMatches = [...rest.matchAll(amountRegex)];
-    if(amountMatches.length===0) return;
-    const figures = amountMatches.map(m=>({
-      val: parseAmountToken(m[0]),
-      x: offsetToX[restStart + m.index] != null ? offsetToX[restStart + m.index] : 0,
-    }));
-    const description = (amountMatches[0].index>0 ? rest.slice(0, amountMatches[0].index) : '').trim() || 'Transaction';
+    let idx = 1;
+    // Skip an optional second date column (Value Date) immediately after.
+    if(row[idx] && dateRegex.test(String(row[idx].str).trim())) idx++;
 
+    const descParts = [];
     let debit=0, credit=0;
-    figures.forEach(({val,x})=>{
-      const dDebit=Math.abs(x-debitX), dCredit=Math.abs(x-creditX);
-      const dBalance = balanceX!=null ? Math.abs(x-balanceX) : Infinity;
-      if(dBalance<=dDebit && dBalance<=dCredit) return; // sits under the Balance column — ignore
-      if(dDebit<=dCredit) debit=val; else credit=val;
-    });
-    if(credit>0) transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(credit), direction:'credit'});
-    else if(debit>0) transactions.push({id:uid(), date:dateStr, description, amount:Math.abs(debit), direction:'debit'});
+    for(; idx<row.length; idx++){
+      const s = String(row[idx].str).trim();
+      if(!s) continue;
+      if(amountTokenRegex.test(s)){
+        const x = row[idx].x;
+        const dDebit = Math.abs(x-debitX), dCredit = Math.abs(x-creditX);
+        const dBalance = balanceX!=null ? Math.abs(x-balanceX) : Infinity;
+        const nearest = Math.min(dDebit, dCredit, dBalance);
+        // Not close enough to any known amount column at all — most
+        // likely a reference number (Tran Id, Cheque ID) in its own
+        // column. Leave it out of both the amounts and the description.
+        if(nearest > TOLERANCE) continue;
+        if(dBalance<=dDebit && dBalance<=dCredit) continue; // the running Balance — ignore
+        const val = Math.abs(parseAmountToken(s));
+        if(val===0) continue; // an explicit 0.00 in the unused cell
+        if(dDebit<=dCredit) debit=val; else credit=val;
+      } else {
+        descParts.push(s);
+      }
+    }
+    const description = descParts.join(' ').trim() || 'Transaction';
+    if(credit>0) transactions.push({id:uid(), date:dateStr, description, amount:credit, direction:'credit'});
+    else if(debit>0) transactions.push({id:uid(), date:dateStr, description, amount:debit, direction:'debit'});
   });
   return transactions;
 }
