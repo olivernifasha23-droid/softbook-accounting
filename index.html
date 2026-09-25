@@ -3158,6 +3158,22 @@ function runMonthlyPayroll(month){
     state.gl.push({id:uid(), date, entry:entryRef, account:consultPayAcct.code, memo:`Payroll ${month} — Consultancy Fees Payable`, debit:0, credit:totals.consultFee});
   }
 
+  // The bank's own fee for making each of this month's transfers (Net
+  // Salary, PAYE, Pension, Maternity, CBHI) — whatever's currently entered
+  // in the Payment/Transfer Summary's "Transfer Charge" column — is real
+  // money the company spends getting payroll paid out, so it belongs on
+  // the Income Statement as a Bank Charges expense the same month, with
+  // the amount owed sitting as a payable until settled, exactly like every
+  // other cost above.
+  const tr = (state.payrollTransfers && state.payrollTransfers[month]) || {};
+  const transferCharge = (parseFloat(tr.netCharge)||0) + (parseFloat(tr.payeCharge)||0) + (parseFloat(tr.pensionCharge)||0) + (parseFloat(tr.maternityCharge)||0) + (parseFloat(tr.cbhiCharge)||0);
+  if(transferCharge>0){
+    const bankChargeExpAcct = state.accounts.find(a=>a.code==='5950') || findOrCreateAccountByName('Bank Charges');
+    const bankChargePayAcct = findOrCreateAccountByName('Bank Charges Payable');
+    state.gl.push({id:uid(), date, entry:entryRef, account:bankChargeExpAcct.code, memo:`Payroll ${month} — Bank Transfer Charges`, debit:transferCharge, credit:0});
+    state.gl.push({id:uid(), date, entry:entryRef, account:bankChargePayAcct.code, memo:`Payroll ${month} — Bank Transfer Charges Payable`, debit:0, credit:transferCharge});
+  }
+
   state.payrollRuns = state.payrollRuns || [];
   // Snapshot each ticked employee's full record + that month's calculated
   // pay, frozen at the moment payroll is run. Once a month has a snapshot,
@@ -3167,7 +3183,7 @@ function runMonthlyPayroll(month){
   const employeeSnapshot = ticked.map(e=>({...e, calc: effectivePayrollCalc(e, month+'-01')}));
   state.payrollRuns.push({id:uid(), month, date, entryRef, employeeCount: ticked.length, employees: employeeSnapshot, ...totals});
   saveState();
-  return {ok:true, month, totals, employeeCount: ticked.length};
+  return {ok:true, month, totals, employeeCount: ticked.length, transferCharge};
 }
 
 // "Back method" / net-to-gross: given a target take-home Net Pay and any
@@ -9110,7 +9126,8 @@ function renderPayroll(){
 // branches) — with a subtotal per branch and a grand total, plus a
 // Prepared/Verified/Approved sign-off block. Sits alongside the Payroll
 // Accounts Recording table and both print together as one PDF.
-function renderPayrollBranchReport(ticked, thisMonth){
+function renderPayrollBranchReport(ticked, thisMonth, opts){
+  opts = opts || {};
   const c = state.settings.company;
   const so = state.settings.payrollSignoff || {};
   const groups = {};
@@ -9127,16 +9144,28 @@ function renderPayrollBranchReport(ticked, thisMonth){
   }),{net:0,meal:0,transport:0,totalReimb:0,consultFee:0,totalPaidUp:0});
   const grand = sumRows(ticked);
 
+  // When printing/saving, a column nobody actually used this month (e.g.
+  // no one has a Consultancy Fee, or Meal/Transport reimbursements aren't
+  // used at all) just adds visual clutter — hide it so the printed table
+  // only shows columns that actually have figures in them this month. The
+  // on-screen table (opts.hideEmptyCols not set) always shows every
+  // column, since that's where these amounts are entered/edited.
+  const showMeal = !opts.hideEmptyCols || grand.meal !== 0;
+  const showTransport = !opts.hideEmptyCols || grand.transport !== 0;
+  const showTotalReimb = !opts.hideEmptyCols || grand.totalReimb !== 0;
+  const showConsultFee = !opts.hideEmptyCols || grand.consultFee !== 0;
+  const totalCols = 4 + 1 + (showMeal?1:0) + (showTransport?1:0) + (showTotalReimb?1:0) + (showConsultFee?1:0) + 1;
+
   const empRow = r => `<tr>
       <td style="font-size:11.5px;">${esc(r.idNumber||'—')}</td>
       <td>${esc(r.familyName||r.name||'—')}</td>
       <td style="font-size:11.5px;">${esc(r.bankName||'—')}</td>
       <td style="font-size:11.5px;">${esc(r.bankAccount||'—')}</td>
       <td class="num-col num">${fmt(r.calc.net)}</td>
-      <td class="num-col num">${fmt(r.calc.mealReimb)}</td>
-      <td class="num-col num">${fmt(r.calc.transportReimb)}</td>
-      <td class="num-col num" style="font-weight:700;">${fmt(r.calc.totalReimb)}</td>
-      <td class="num-col num">${fmt(r.calc.consultFee)}</td>
+      ${showMeal?`<td class="num-col num">${fmt(r.calc.mealReimb)}</td>`:''}
+      ${showTransport?`<td class="num-col num">${fmt(r.calc.transportReimb)}</td>`:''}
+      ${showTotalReimb?`<td class="num-col num" style="font-weight:700;">${fmt(r.calc.totalReimb)}</td>`:''}
+      ${showConsultFee?`<td class="num-col num">${fmt(r.calc.consultFee)}</td>`:''}
       <td class="num-col num" style="font-weight:700;">${fmt(r.calc.totalPaidUp)}</td>
     </tr>`;
   const subtotalRow = (label, rows) => {
@@ -9144,10 +9173,10 @@ function renderPayrollBranchReport(ticked, thisMonth){
     return `<tr style="font-weight:700;background:rgba(35,79,58,0.10);">
       <td colspan="4" style="text-align:center;">${esc(label)}</td>
       <td class="num-col num">${fmt(s.net)}</td>
-      <td class="num-col num">${fmt(s.meal)}</td>
-      <td class="num-col num">${fmt(s.transport)}</td>
-      <td class="num-col num">${fmt(s.totalReimb)}</td>
-      <td class="num-col num">${fmt(s.consultFee)}</td>
+      ${showMeal?`<td class="num-col num">${fmt(s.meal)}</td>`:''}
+      ${showTransport?`<td class="num-col num">${fmt(s.transport)}</td>`:''}
+      ${showTotalReimb?`<td class="num-col num">${fmt(s.totalReimb)}</td>`:''}
+      ${showConsultFee?`<td class="num-col num">${fmt(s.consultFee)}</td>`:''}
       <td class="num-col num">${fmt(s.totalPaidUp)}</td>
     </tr>`;
   };
@@ -9155,7 +9184,7 @@ function renderPayrollBranchReport(ticked, thisMonth){
   let bodyRows;
   if(showBranches){
     bodyRows = branchKeys.map(k=>
-      `<tr><td colspan="10" style="text-align:center;font-weight:700;background:var(--ink-navy);color:#fff;padding:5px;">${esc(k.toUpperCase())} BRANCH</td></tr>`
+      `<tr><td colspan="${totalCols}" style="text-align:center;font-weight:700;background:var(--ink-navy);color:#fff;padding:5px;">${esc(k.toUpperCase())} BRANCH</td></tr>`
       + groups[k].map(empRow).join('')
       + subtotalRow(`${k.toUpperCase()} SUBTOTAL`, groups[k])
     ).join('');
@@ -9173,19 +9202,24 @@ function renderPayrollBranchReport(ticked, thisMonth){
         <thead>
           <tr>
             <th>Employee ID/Passport</th><th>Family Name / Full Name</th><th>Bank Name</th><th>Bank Account</th>
-            <th class="num-col">Net Salary<br>(Take-Home)</th><th class="num-col">Meal<br>Reimb.</th><th class="num-col">Transport<br>Reimb.</th><th class="num-col">Total<br>Reimb.</th><th class="num-col">Consult.<br>Fee</th><th class="num-col">Total<br>Paid Up</th>
+            <th class="num-col">Net Salary<br>(Take-Home)</th>
+            ${showMeal?`<th class="num-col">Meal<br>Reimb.</th>`:''}
+            ${showTransport?`<th class="num-col">Transport<br>Reimb.</th>`:''}
+            ${showTotalReimb?`<th class="num-col">Total<br>Reimb.</th>`:''}
+            ${showConsultFee?`<th class="num-col">Consult.<br>Fee</th>`:''}
+            <th class="num-col">Total<br>Paid Up</th>
           </tr>
         </thead>
         <tbody>
           ${bodyRows||''}
-          ${ticked.length===0?'<tr><td colspan="10" style="text-align:center;color:var(--text-soft);padding:16px;">No employees ticked as worked this month.</td></tr>':''}
+          ${ticked.length===0?`<tr><td colspan="${totalCols}" style="text-align:center;color:var(--text-soft);padding:16px;">No employees ticked as worked this month.</td></tr>`:''}
           <tr class="total-row">
             <td colspan="4">GRAND TOTAL — ALL${showBranches?' BRANCHES':''}</td>
             <td class="num-col num">${fmt(grand.net)}</td>
-            <td class="num-col num">${fmt(grand.meal)}</td>
-            <td class="num-col num">${fmt(grand.transport)}</td>
-            <td class="num-col num">${fmt(grand.totalReimb)}</td>
-            <td class="num-col num">${fmt(grand.consultFee)}</td>
+            ${showMeal?`<td class="num-col num">${fmt(grand.meal)}</td>`:''}
+            ${showTransport?`<td class="num-col num">${fmt(grand.transport)}</td>`:''}
+            ${showTotalReimb?`<td class="num-col num">${fmt(grand.totalReimb)}</td>`:''}
+            ${showConsultFee?`<td class="num-col num">${fmt(grand.consultFee)}</td>`:''}
             <td class="num-col num">${fmt(grand.totalPaidUp)}</td>
           </tr>
         </tbody>
@@ -9199,7 +9233,7 @@ function renderPayrollBranchReport(ticked, thisMonth){
       <button class="btn btn-ghost btn-sm" id="pPrintFullReportBtn" style="margin-top:10px;">🖨 Print / Save as PDF — Employee Summary + Accounts Recording</button>
     </div>
 
-    ${renderAttendanceSection()}
+    ${opts.hideEmptyCols ? '' : renderAttendanceSection()}
   `;
 }
 
@@ -10002,7 +10036,23 @@ function printPayrollFullReport(){
   const summaryBox = document.getElementById('payrollSummaryBox');
   if(!branchBox || !summaryBox) return;
 
-  const branchClone = branchBox.cloneNode(true);
+  // Re-render the Employee Summary table specifically for print, with
+  // opts.hideEmptyCols on — this drops columns nobody used this month
+  // (Meal/Transport Reimb., Consultancy Fee) instead of cloning the
+  // live on-screen table, which always shows every column so it stays
+  // editable. thisMonth/ticked are recomputed the same way the Payroll
+  // page itself computes them, since this print function is a separate
+  // top-level function and doesn't have access to that render's locals.
+  const thisMonth = payrollRunMonth;
+  const alreadyRun = (state.payrollRuns||[]).find(r=>r.month===thisMonth);
+  const isLocked = !!(alreadyRun && alreadyRun.employees && alreadyRun.employees.length);
+  const printRows = isLocked
+    ? alreadyRun.employees.map(e=>({...e}))
+    : state.payroll.map(e=>({...e, calc: effectivePayrollCalc(e, thisMonth+'-01')}));
+  const printTicked = isLocked ? printRows : printRows.filter(r=>r.workedThisMonth!==false);
+  const branchWrapper = document.createElement('div');
+  branchWrapper.innerHTML = renderPayrollBranchReport(printTicked, thisMonth, {hideEmptyCols:true});
+  const branchClone = branchWrapper.querySelector('#payrollBranchReportBox');
   branchClone.querySelectorAll('button').forEach(el=>el.remove());
   branchClone.querySelectorAll('input').forEach(el=>{
     const span = document.createElement('span');
@@ -10010,6 +10060,7 @@ function printPayrollFullReport(){
     span.style.cssText = 'display:inline-block;min-width:140px;border-bottom:1px solid #999;padding:2px 4px;font-style:italic;';
     el.parentNode.replaceChild(span, el);
   });
+  scalePrintClone(branchClone, 1.3);
 
   const summaryClone = summaryBox.cloneNode(true);
   summaryClone.querySelectorAll('button').forEach(el=>el.remove());
