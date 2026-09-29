@@ -9238,11 +9238,24 @@ function renderPayrollBranchReport(ticked, thisMonth, opts){
   const showTransport = !opts.hideEmptyCols || grand.transport !== 0;
   const showTotalReimb = !opts.hideEmptyCols || grand.totalReimb !== 0;
   const showConsultFee = !opts.hideEmptyCols || grand.consultFee !== 0;
-  const totalCols = 4 + 1 + (showMeal?1:0) + (showTransport?1:0) + (showTotalReimb?1:0) + (showConsultFee?1:0) + 1;
+  const totalCols = 5 + 1 + (showMeal?1:0) + (showTransport?1:0) + (showTotalReimb?1:0) + (showConsultFee?1:0) + 1;
+
+  // The "Family Name / Full Name" column was showing ONLY the family name
+  // (e.g. "Manzi") when one was on file, instead of the employee's actual
+  // full name — prefer the full Name field (first + last, exactly what was
+  // typed or imported), falling back to combining Other Names + Family
+  // Name, and finally to whichever single name field is available.
+  const fullEmployeeName = r => r.name || [r.otherNames, r.familyName].filter(Boolean).join(' ').trim() || r.familyName || r.otherNames || '—';
+
+  // Serial numbers run 1..N across the WHOLE ticked list (not restarting
+  // per branch), matching how a bank transfer sheet is normally numbered.
+  const serialOf = new Map();
+  ticked.forEach((r,i)=> serialOf.set(r, i+1));
 
   const empRow = r => `<tr>
+      <td class="num-col" style="text-align:center;font-size:11.5px;">${serialOf.get(r)||''}</td>
       <td style="font-size:11.5px;">${esc(r.idNumber||'—')}</td>
-      <td>${esc(r.familyName||r.name||'—')}</td>
+      <td>${esc(fullEmployeeName(r))}</td>
       <td style="font-size:11.5px;">${esc(r.bankName||'—')}</td>
       <td style="font-size:11.5px;">${esc(r.bankAccount||'—')}</td>
       <td class="num-col num">${fmt(r.calc.net)}</td>
@@ -9255,7 +9268,7 @@ function renderPayrollBranchReport(ticked, thisMonth, opts){
   const subtotalRow = (label, rows) => {
     const s = sumRows(rows);
     return `<tr style="font-weight:700;background:rgba(35,79,58,0.10);">
-      <td colspan="4" style="text-align:center;">${esc(label)}</td>
+      <td colspan="5" style="text-align:center;">${esc(label)}</td>
       <td class="num-col num">${fmt(s.net)}</td>
       ${showMeal?`<td class="num-col num">${fmt(s.meal)}</td>`:''}
       ${showTransport?`<td class="num-col num">${fmt(s.transport)}</td>`:''}
@@ -9285,7 +9298,7 @@ function renderPayrollBranchReport(ticked, thisMonth, opts){
       <table class="led" style="font-size:12px;">
         <thead>
           <tr>
-            <th>Employee ID/Passport</th><th>Family Name / Full Name</th><th>Bank Name</th><th>Bank Account</th>
+            <th class="num-col">#</th><th>Employee ID/Passport</th><th>Family Name / Full Name</th><th>Bank Name</th><th>Bank Account</th>
             <th class="num-col">Net Salary<br>(Take-Home)</th>
             ${showMeal?`<th class="num-col">Meal<br>Reimb.</th>`:''}
             ${showTransport?`<th class="num-col">Transport<br>Reimb.</th>`:''}
@@ -9298,7 +9311,7 @@ function renderPayrollBranchReport(ticked, thisMonth, opts){
           ${bodyRows||''}
           ${ticked.length===0?`<tr><td colspan="${totalCols}" style="text-align:center;color:var(--text-soft);padding:16px;">No employees ticked as worked this month.</td></tr>`:''}
           <tr class="total-row">
-            <td colspan="4">GRAND TOTAL — ALL${showBranches?' BRANCHES':''}</td>
+            <td colspan="5">GRAND TOTAL — ALL${showBranches?' BRANCHES':''}</td>
             <td class="num-col num">${fmt(grand.net)}</td>
             ${showMeal?`<td class="num-col num">${fmt(grand.meal)}</td>`:''}
             ${showTransport?`<td class="num-col num">${fmt(grand.transport)}</td>`:''}
@@ -10063,12 +10076,28 @@ function printPayrollRecording(){
   const clone = box.cloneNode(true);
   clone.querySelectorAll('button').forEach(el=>el.remove());
   scalePrintClone(clone, 1.4);
+  const logo = state.settings.company.logo;
+  if(logo){
+    const logoImg = document.createElement('img');
+    logoImg.src = logo; logoImg.alt = 'Company logo';
+    logoImg.style.cssText = 'max-height:56px;margin-bottom:8px;display:block;';
+    clone.insertBefore(logoImg, clone.firstChild);
+  }
   const bodyHTML = clone.innerHTML;
   const w2 = window.open('', '_blank');
   if(!w2){ alert('Please allow pop-ups to print this recording.'); return; }
   w2.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(state.settings.company.name||'Company')} — Payroll Recording</title>
 <style>
+  /* This popup doesn't inherit the main app's page styles, so the custom
+     color properties used in the cloned content (e.g. var(--ink-navy))
+     need to be defined here too, or titles silently print in plain black. */
+  :root{
+    --ink-navy:#16233D; --ledger-green-dk:#234F3A; --amber:#C08A28;
+    --rule:#D8D2C4; --rule-dk:#B9B0A0; --ink-red:#A23B2E; --text:#241F16;
+    --text-soft:#6B6455; --white:#FFFFFF; --parchment:#F7F4EC; --parchment-2:#EFEADC;
+  }
   @page{ margin:12mm; }
+  *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   body{font-family:Arial,Helvetica,sans-serif;padding:30px;color:#241F16;max-width:880px;margin:0 auto;}
   table{width:100%;border-collapse:collapse;margin-top:14px;}
   td,th{padding:10px 8px;font-size:17px;text-align:left;}
@@ -10093,12 +10122,28 @@ function printPayrollTransfer(){
     el.parentNode.replaceChild(span, el);
   });
   scalePrintClone(clone, 1.4);
+  const logo = state.settings.company.logo;
+  if(logo){
+    const logoImg = document.createElement('img');
+    logoImg.src = logo; logoImg.alt = 'Company logo';
+    logoImg.style.cssText = 'max-height:56px;margin-bottom:8px;display:block;';
+    clone.insertBefore(logoImg, clone.firstChild);
+  }
   const bodyHTML = clone.innerHTML;
   const w2 = window.open('', '_blank');
   if(!w2){ alert('Please allow pop-ups to print this summary.'); return; }
   w2.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(state.settings.company.name||'Company')} — Payroll Transfer Summary</title>
 <style>
+  /* This popup doesn't inherit the main app's page styles, so the custom
+     color properties used in the cloned content (e.g. var(--ink-navy))
+     need to be defined here too, or titles silently print in plain black. */
+  :root{
+    --ink-navy:#16233D; --ledger-green-dk:#234F3A; --amber:#C08A28;
+    --rule:#D8D2C4; --rule-dk:#B9B0A0; --ink-red:#A23B2E; --text:#241F16;
+    --text-soft:#6B6455; --white:#FFFFFF; --parchment:#F7F4EC; --parchment-2:#EFEADC;
+  }
   @page{ margin:12mm; }
+  *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   body{font-family:Arial,Helvetica,sans-serif;padding:30px;color:#241F16;max-width:880px;margin:0 auto;}
   table{width:100%;border-collapse:collapse;margin-top:14px;}
   td,th{padding:10px 8px;font-size:17px;text-align:left;}
@@ -10150,23 +10195,62 @@ function printPayrollFullReport(){
   summaryClone.querySelectorAll('button').forEach(el=>el.remove());
   scalePrintClone(summaryClone, 1.3);
 
+  // Show the company logo at the top of each printed page/section, when
+  // one's been uploaded in Settings — matching how the other financial
+  // reports already show it.
+  const logo = state.settings.company.logo;
+  if(logo){
+    const branchLogo = document.createElement('img');
+    branchLogo.src = logo; branchLogo.alt = 'Company logo';
+    branchLogo.style.cssText = 'max-height:56px;margin-bottom:8px;display:block;';
+    branchClone.insertBefore(branchLogo, branchClone.firstChild);
+    const summaryLogo = document.createElement('img');
+    summaryLogo.src = logo; summaryLogo.alt = 'Company logo';
+    summaryLogo.style.cssText = 'max-height:56px;margin-bottom:8px;display:block;';
+    summaryClone.insertBefore(summaryLogo, summaryClone.firstChild);
+  }
+
   const w2 = window.open('', '_blank');
   if(!w2){ alert('Please allow pop-ups to print this report.'); return; }
   w2.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(state.settings.company.name||'Company')} — Payroll Report</title>
 <style>
+  /* These popup print windows don't inherit the main app's page styles, so
+     the custom color properties used throughout the cloned content (e.g.
+     var(--ink-navy)) need to be defined here too, or every title/heading
+     that relies on them silently prints in plain black instead. */
+  :root{
+    --ink-navy:#16233D; --ledger-green-dk:#234F3A; --amber:#C08A28;
+    --rule:#D8D2C4; --rule-dk:#B9B0A0; --ink-red:#A23B2E; --text:#241F16;
+    --text-soft:#6B6455; --white:#FFFFFF; --parchment:#F7F4EC; --parchment-2:#EFEADC;
+  }
   @page{ margin:12mm; }
+  *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   body{font-family:Arial,Helvetica,sans-serif;padding:24px;color:#241F16;margin:0 auto;max-width:1100px;}
   table{width:100%;border-collapse:collapse;margin-top:8px;}
   td,th{padding:6px 7px;font-size:12.5px;text-align:left;}
   th{border-bottom:1.5px solid #16233D;}
   .num{text-align:right;}
+  .num-col{text-align:right;}
+  /* Table headers and the Grand Total row need their own bold, colored
+     look defined here — the main app's .led / .total-row classes aren't
+     part of this popup's stylesheet, so without this they'd fall back to
+     plain unstyled table text. */
+  table.led thead th{ text-align:left; font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--white); background:var(--ledger-green-dk); padding:8px 9px; }
+  table.led thead th.num-col{ text-align:right; }
+  table.led tbody tr.total-row td{ font-weight:700; color:var(--ledger-green-dk); border-top:2px solid var(--ink-navy); background:var(--parchment-2); }
   .section-block{margin-bottom:30px;}
-  .section-block:last-child table{max-width:640px;}
+  .section-block-2 table{max-width:640px;}
+  /* "Payroll Accounts Recording" starts fresh on its own page, right after
+     the Grand Total of the Employee Summary table above it. (Targeting a
+     dedicated class here rather than :last-child, since the "Print / Save
+     as PDF" button div that follows both sections would otherwise make
+     :last-child match nothing at all.) */
+  .section-block-2{ page-break-before:always; break-before:page; }
   @media print{ .no-print{display:none;} body{padding:0;max-width:100%;width:88%;margin:0 auto;} }
 </style>
 </head><body>
   <div class="section-block">${branchClone.innerHTML}</div>
-  <div class="section-block">${summaryClone.innerHTML}</div>
+  <div class="section-block section-block-2">${summaryClone.innerHTML}</div>
   <div class="no-print" style="margin-top:24px;"><button onclick="window.print()" style="padding:10px 18px;background:#234F3A;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">Print / Save as PDF</button></div>
 </body></html>`);
   w2.document.close();
