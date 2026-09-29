@@ -476,7 +476,20 @@ function defaultState(){
       ],
       payrollSignoff:{preparedBy:'', verifiedBy:'', approvedBy:''},
       reimbRates:{food:2000, transport:3000, maxDays:30},
-      showRevenueStreams: false // per-company toggle — only hospitality businesses (accommodation/restaurant) see the Monthly Revenue Streams table on the Dashboard
+      showRevenueStreams: false, // per-company toggle — only hospitality businesses (accommodation/restaurant) see the Monthly Revenue Streams table on the Dashboard
+      // The handful of narrative disclosures the Notes to the Financial
+      // Statements report can't derive from the ledger itself — everything
+      // else on that report (PP&E, receivables/payables, cash, payroll,
+      // tax) is computed live from real data, but these four are genuinely
+      // free text, editable directly on that report page. Sensible,
+      // conservative defaults so a company that never touches them still
+      // gets a complete-looking set of notes.
+      notesToFinancials:{
+        natureOfBusiness:'',
+        goingConcern:'The financial statements have been prepared on a going concern basis, which assumes the company will continue in operation for the foreseeable future and be able to realize its assets and discharge its liabilities in the normal course of business.',
+        contingencies:'There were no material contingent liabilities or capital commitments as at the reporting date.',
+        subsequentEvents:'No material events have occurred after the reporting date that would require adjustment to, or disclosure in, these financial statements.',
+      }
     },
     accounts: defaultAccounts(),
     taxTypes: defaultTaxTypes(),
@@ -1399,8 +1412,8 @@ const PLANS = {
   // be included here or Bookkeeping users get locked out of core ledger
   // and financial-statement functionality that "bookkeeping" obviously
   // includes.
-  bookkeeping: {label: 'Bookkeeping', price: 20000, tabs: ['dashboard','reports','gl','tb','pl','bs','cashflow','invoices','ar','ap','aged','collection','customers','vendors','coa','bankrec','bankimport','pettycash','settings']},
-  standard:    {label: 'Bookkeeping + Inventory', price: 35000, tabs: ['dashboard','reports','gl','tb','pl','bs','cashflow','invoices','ar','ap','aged','collection','customers','vendors','coa','bankrec','bankimport','pettycash','settings','inventory']},
+  bookkeeping: {label: 'Bookkeeping', price: 20000, tabs: ['dashboard','reports','gl','tb','pl','bs','equity','notes','cashflow','invoices','ar','ap','aged','collection','customers','vendors','coa','bankrec','bankimport','pettycash','settings']},
+  standard:    {label: 'Bookkeeping + Inventory', price: 35000, tabs: ['dashboard','reports','gl','tb','pl','bs','equity','notes','cashflow','invoices','ar','ap','aged','collection','customers','vendors','coa','bankrec','bankimport','pettycash','settings','inventory']},
   full:        {label: 'All Access',  price: 86000, tabs: null /* null = every tab */},
 };
 const MANUAL_PAY_MOBILE_MONEY = '0789629252';
@@ -2587,6 +2600,49 @@ function computeBalanceSheet(asOf){
           currentLiab, totalCurrentLiab, nonCurrentLiab, totalNonCurrentLiab, totalLiab,
           equity, totalEquity, totalLiabEquity,
           balanced: Math.abs(totalAssets - totalLiabEquity) < 1};
+}
+
+// Statement of Changes in Equity for a From/To period — built the same
+// data-driven way as the Balance Sheet: one column per Equity-type account
+// that actually exists in this client's own Chart of Accounts (Share
+// Capital, Retained Earnings, or anything else they've added), plus a
+// "Retained Earnings (Undistributed Profit)" column for the same running,
+// not-yet-formally-transferred net profit the Balance Sheet shows as its
+// own "Current Year Net Profit" line — so this statement's closing row
+// always reconciles exactly to the Balance Sheet's Total Equity as of the
+// same date, whatever the mix of equity accounts happens to be.
+function computeEquityStatement(from, to){
+  const dayBefore = addDays(from, -1);
+  const equityAccounts = state.accounts.filter(a=>a.type==='Equity').sort((a,b)=>a.code.localeCompare(b.code));
+  const acctAmt = (code, f, t) => -sumAccount(code, f, t, 'net');
+  const columns = equityAccounts.map(a=>({code:a.code, name: tAccountName(a.code, a.name)}))
+    .concat([{code:'RE', name:'Retained Earnings (Undistributed Profit)'}]);
+  const rowFor = (f, t) => {
+    const byAccount = {};
+    equityAccounts.forEach(a=> byAccount[a.code] = acctAmt(a.code, f, t));
+    byAccount.RE = computePL(f, t).netAfterTax;
+    const total = columns.reduce((s,c)=> s + (byAccount[c.code]||0), 0);
+    return {byAccount, total};
+  };
+  const opening = rowFor(null, dayBefore);
+  const movement = rowFor(from, to);
+  const closing = rowFor(null, to);
+  // Any equity account that moved during the period (a capital
+  // contribution, a drawing/dividend, a direct adjustment to Retained
+  // Earnings) gets its own labeled movement row instead of one opaque
+  // lump sum — so a reader can see WHAT changed, not just that something
+  // did. Net Profit for the period always shows as its own row even when
+  // zero, since it's the expected, standard line every reader looks for.
+  const movementRows = columns
+    .filter(c=> c.code!=='RE' && Math.abs(movement.byAccount[c.code]||0) > 0.5)
+    .map(c=> ({label: `Movement in ${c.name}`, byAccount: {[c.code]: movement.byAccount[c.code]}, total: movement.byAccount[c.code]}));
+  return {
+    columns, opening, closing,
+    netProfit: movement.byAccount.RE,
+    movementRows,
+    balancedOpening: Math.abs(opening.total - computeBalanceSheet(dayBefore).totalEquity) < 1,
+    balancedClosing: Math.abs(closing.total - computeBalanceSheet(to).totalEquity) < 1,
+  };
 }
 
 function payeFor(gross){
@@ -4838,6 +4894,8 @@ const TRANSLATIONS = {
   nav_tb: {en:'Trial Balance', fr:'Balance de vérification'},
   nav_pl: {en:'Profit & Loss', fr:'Compte de résultat'},
   nav_bs: {en:'Balance Sheet', fr:'Bilan'},
+  nav_equity: {en:'Statement of Changes in Equity', fr:'État des variations des capitaux propres'},
+  nav_notes: {en:'Notes to the Financial Statements', fr:'Notes aux états financiers'},
   nav_cashflow: {en:'Cash Flow', fr:'Flux de trésorerie'},
   nav_invoices: {en:'Invoices', fr:'Factures'},
   nav_profees: {en:'Professional Fees', fr:'Honoraires professionnels'},
@@ -4873,6 +4931,10 @@ const TRANSLATIONS = {
   tb_sub_period: {en:'All accounts for the selected period. Debits should equal credits.', fr:'Tous les comptes pour la période sélectionnée. Les débits doivent égaler les crédits.'},
   gl_sub_alltime: {en:'Every debit and credit for the business, all time. All reports below draw from this ledger.', fr:'Chaque débit et crédit de l\'entreprise, toutes périodes confondues. Tous les rapports ci-dessous proviennent de ce grand livre.'},
   gl_sub_period: {en:'Every debit and credit for the business in the selected period. All reports below draw from this ledger.', fr:'Chaque débit et crédit de l\'entreprise pour la période sélectionnée. Tous les rapports ci-dessous proviennent de ce grand livre.'},
+  title_equity: {en:'Statement of Changes in Equity', fr:'État des variations des capitaux propres'},
+  sub_equity: {en:'How each component of equity moved over the selected period.', fr:'Comment chaque composante des capitaux propres a évolué au cours de la période sélectionnée.'},
+  title_notes: {en:'Notes to the Financial Statements', fr:'Notes aux états financiers'},
+  sub_notes: {en:'Supporting detail behind every figure in the financial statements.', fr:'Détails à l\'appui de chaque chiffre des états financiers.'},
   title_cashflow: {en:'Cash Flow Statement', fr:'État des flux de trésorerie'},
   sub_cashflow: {en:'Cash movements for the selected period, by activity.', fr:'Mouvements de trésorerie pour la période sélectionnée, par activité.'},
   cf_opening: {en:'Opening Cash Balance', fr:'Solde de trésorerie d\'ouverture'},
@@ -5439,6 +5501,7 @@ function renderMain(){
   const main = document.getElementById('mainArea');
   const renderers = {
     dashboard: renderDashboard, reports: renderReportsHub, gl: renderGL, tb: renderTB, pl: renderPL, bs: renderBS,
+    equity: renderEquityStatement, notes: renderNotesToFinancials,
     cashflow: renderCashFlow, invoices: renderInvoicesTab, profees: renderProfessionalFees,
     payroll: renderPayroll, ar: renderAR, ap: renderAP, aged: renderAgedReport, collection: renderCollectionHistory,
     customers: ()=>renderLedgerTab('customers', t('title_customers')),
@@ -5564,7 +5627,9 @@ function renderReportsHub(){
     ${reportCategory('Financial Statements', [
       reportCard('pl', '📈', 'Profit & Loss', 'Revenue, costs, and expenses for any period.'),
       reportCard('bs', '⚖️', 'Balance Sheet', 'Assets, liabilities, and equity as of any date.'),
+      reportCard('equity', '📐', 'Statement of Changes in Equity', 'How Share Capital, Retained Earnings, and each equity account moved over a period.'),
       reportCard('cashflow', '💵', 'Cash Flow Statement', 'Cash movements by operating, investing, financing activity.'),
+      reportCard('notes', '📝', 'Notes to the Financial Statements', 'Supporting detail behind every figure — assets, receivables, payables, equity, tax, and more.'),
     ].join(''))}
 
     ${reportCategory('Ledgers & Balances', [
@@ -8890,6 +8955,260 @@ function renderBS(){
     <div class="ledger-panel" style="margin-top:18px;">
       <span class="badge ${bs.balanced?'ok':'bad'}">${bs.balanced ? 'Balanced — Assets = Liabilities + Equity' : 'Out of balance by '+fmt(Math.abs(bs.totalAssets-bs.totalLiabEquity))}</span>
     </div>
+  `;
+}
+
+/* ============================================================
+   STATEMENT OF CHANGES IN EQUITY
+   ============================================================ */
+function renderEquityStatement(){
+  // Shares periodFrom/periodTo/reportPeriodPreset with P&L and Cash Flow
+  // (same convention, same reasoning as those two), but a Statement of
+  // Changes in Equity specifically needs a real starting date to compute
+  // an opening balance — so an empty "From" (leftover from an All-Time
+  // selection made on the P&L or Cash Flow tab) defaults sensibly here to
+  // the start of the current calendar year, WITHOUT overwriting the
+  // shared value itself, so switching back to those other tabs still
+  // shows whatever they actually had selected.
+  const eqFrom = periodFrom || (todayISO().slice(0,4)+'-01-01');
+  const eqTo = periodTo || todayISO();
+  const eq = computeEquityStatement(eqFrom, eqTo);
+  const amtCell = (v) => `<td class="num-col num${v<0?' neg':''}">${v?fmt(v):'—'}</td>`;
+  const row = (label, byAccount, total, opts) => `<tr${opts&&opts.total?' class="total-row"':''}>
+      <td>${esc(label)}</td>
+      ${eq.columns.map(c=>amtCell(byAccount[c.code]||0)).join('')}
+      ${amtCell(total)}
+    </tr>`;
+  return `
+    ${reportHeader(`Statement of Changes in Equity (From ${dmy(eqFrom)} To ${dmy(eqTo)})`, 'How each component of equity moved over the selected period.')}
+    <div class="field-row">
+      <div class="field"><label>Report Period</label>${reportPeriodSelectHTML('eqPeriodPreset', reportPeriodPreset)}</div>
+      <div class="field"><label>From</label><input type="date" id="eqFrom" value="${eqFrom}"></div>
+      <div class="field"><label>To</label><input type="date" id="eqTo" value="${eqTo}"></div>
+      <button class="btn btn-ghost" id="eqApply">${t('btn_apply')}</button>
+      <button class="btn btn-ghost" id="printReportBtn">🖨 Print / Save as PDF</button>
+      <button class="btn btn-ghost" id="exportExcelBtn" data-report-title="Statement of Changes in Equity">📊 Export to Excel</button>
+    </div>
+    <div class="ledger-panel" style="overflow-x:auto;">
+      <table class="led">
+        <thead>
+          <tr>
+            <th>&nbsp;</th>
+            ${eq.columns.map(c=>`<th class="num-col">${esc(c.name)}</th>`).join('')}
+            <th class="num-col">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${row(`Balance at ${dmy(addDays(eqFrom,-1))}`, eq.opening.byAccount, eq.opening.total, {total:true})}
+          ${row('Net Profit for the Period', {RE: eq.netProfit}, eq.netProfit)}
+          ${eq.movementRows.map(m=>row(m.label, m.byAccount, m.total)).join('')}
+          ${row(`Balance at ${dmy(eqTo)}`, eq.closing.byAccount, eq.closing.total, {total:true})}
+        </tbody>
+      </table>
+    </div>
+    <div class="ledger-panel" style="margin-top:18px;">
+      <span class="badge ${eq.balancedOpening && eq.balancedClosing ? 'ok' : 'bad'}">${eq.balancedOpening && eq.balancedClosing ? 'Reconciles with the Balance Sheet\'s Total Equity at both dates' : 'Does not reconcile with the Balance Sheet — check for an unusual entry directly against an Equity account'}</span>
+    </div>
+    <div class="note" style="margin-top:14px;">"Retained Earnings (Undistributed Profit)" is the same running net profit the Balance Sheet shows as "Current Year Net Profit" — it isn't moved into a dedicated Retained Earnings account automatically, so it stays visible here as its own column until you post that transfer yourself (or simply leave it as-is, which is normal for a business that hasn't yet run a formal year-end close).</div>
+  `;
+}
+
+/* ============================================================
+   NOTES TO THE FINANCIAL STATEMENTS — every numbered note is computed
+   live from the same ledger every other report reads, using this
+   client's own Chart of Accounts, Fixed Asset register, Payroll, and Tax
+   settings — never a fixed template. A handful of disclosures genuinely
+   can't be derived from the books (nature of business, going concern,
+   contingencies, subsequent events) and are freely editable right on
+   this page instead.
+   ============================================================ */
+function computeNotesData(asOf, from, to){
+  const bs = computeBalanceSheet(asOf);
+  const pl = computePL(from, to);
+
+  const activeAssets = (state.fixedAssets||[]).filter(a=>!a.disposed);
+  const ppeByCategory = {};
+  activeAssets.forEach(a=>{
+    const cat = a.category || 'Uncategorized';
+    const bucket = ppeByCategory[cat] || (ppeByCategory[cat] = {category:cat, cost:0, accumDepr:0, nbv:0});
+    bucket.cost += Number(a.cost)||0;
+    bucket.accumDepr += assetAccumulatedDepr(a);
+    bucket.nbv += assetNetBookValue(a);
+  });
+  const ppeRows = Object.values(ppeByCategory).sort((a,b)=>a.category.localeCompare(b.category));
+  const ppeTotal = ppeRows.reduce((s,r)=>({cost:s.cost+r.cost, accumDepr:s.accumDepr+r.accumDepr, nbv:s.nbv+r.nbv}), {cost:0,accumDepr:0,nbv:0});
+
+  const cashAccounts = state.accounts.filter(a=>a.type==='Asset' && /cash|bank/i.test(a.name) && !/receivable/i.test(a.name)).sort((a,b)=>a.code.localeCompare(b.code));
+  const cashRows = cashAccounts.map(a=>({code:a.code, name:tAccountName(a.code,a.name), amt: sumAccount(a.code, null, asOf, 'net')}));
+  const cashTotal = cashRows.reduce((s,r)=>s+r.amt,0);
+
+  const arTotal = sumAccount('1100', null, asOf, 'net');
+  const apTotal = -sumAccount('2000', null, asOf, 'net');
+  const otherPayableRows = [...bs.currentLiab, ...bs.nonCurrentLiab].filter(l=>l.code!=='2000');
+  const otherPayableTotal = otherPayableRows.reduce((s,l)=>s+l.amt,0);
+  const totalPayables = apTotal + otherPayableTotal;
+
+  const inventoryTotal = totalInventoryValue();
+  const inventoryItemCount = (state.inventory||[]).length;
+
+  const equityAccounts = state.accounts.filter(a=>a.type==='Equity').sort((a,b)=>a.code.localeCompare(b.code));
+  const equityRows = equityAccounts.map(a=>({code:a.code, name:tAccountName(a.code,a.name), amt: -sumAccount(a.code, null, asOf, 'net')}));
+
+  const relatedPartyRows = state.accounts
+    .filter(a=>a.type==='Liability' && /shareholder|director/i.test(a.name))
+    .map(a=>({code:a.code, name:tAccountName(a.code,a.name), amt: -sumAccount(a.code, null, asOf, 'net')}))
+    .filter(r=>Math.abs(r.amt)>0.5);
+
+  const grossLine = pl.opex.find(o=>o.code==='5100');
+  const erLine = pl.opex.find(o=>o.code==='5110');
+  const headcount = (state.payroll||[]).length;
+  const totalPayrollCost = (grossLine?grossLine.amt:0) + (erLine?erLine.amt:0);
+
+  const vatClaimedRow = bs.currentAssets.find(a=>a.code==='VAT-CLAIMED');
+  const vatPayableRow = bs.currentLiab.find(a=>a.code==='VAT-PAYABLE');
+
+  return {
+    bs, pl,
+    ppeRows, ppeTotal, hasFixedAssets: activeAssets.length>0,
+    cashRows, cashTotal,
+    arTotal, apTotal, otherPayableRows, otherPayableTotal, totalPayables,
+    inventoryTotal, inventoryItemCount, hasInventory: inventoryItemCount>0,
+    equityRows,
+    relatedPartyRows,
+    headcount, totalPayrollCost, hasPayroll: headcount>0,
+    vatClaimedAmt: vatClaimedRow?vatClaimedRow.amt:0, vatPayableAmt: vatPayableRow?vatPayableRow.amt:0,
+  };
+}
+
+function renderNotesToFinancials(){
+  const asOf = asOfDate;
+  const from = periodFrom || (todayISO().slice(0,4)+'-01-01');
+  const to = periodTo || todayISO();
+  const n = computeNotesData(asOf, from, to);
+  const c = state.settings.company;
+  const nf = state.settings.notesToFinancials;
+  const money = (v) => `${fmt(v)} ${baseCurrencyCode()}`;
+  let num = 0;
+  const note = (title, bodyHTML) => { num++; return `
+    <div class="ledger-panel" style="margin-bottom:18px;">
+      <div class="section-label" style="margin-top:0;">Note ${num} — ${esc(title)}</div>
+      ${bodyHTML}
+    </div>`;
+  };
+
+  return `
+    ${reportHeader('Notes to the Financial Statements', `For the period ${dmy(from)} to ${dmy(to)}, and financial position as of ${dmy(asOf)}.`)}
+    <div class="field-row">
+      <div class="field"><label>Period (From)</label><input type="date" id="notesFrom" value="${from}"></div>
+      <div class="field"><label>Period (To)</label><input type="date" id="notesTo" value="${to}"></div>
+      <div class="field"><label>As Of Date</label><input type="date" id="notesAsOf" value="${asOf}"></div>
+      <button class="btn btn-ghost" id="notesApply">${t('btn_apply')}</button>
+      <button class="btn btn-ghost" id="printReportBtn">🖨 Print / Save as PDF</button>
+      <button class="btn btn-ghost" id="exportExcelBtn" data-report-title="Notes to the Financial Statements">📊 Export to Excel</button>
+    </div>
+
+    ${note('Reporting Entity', `
+      <p style="font-size:13.5px;margin:0 0 10px;">${esc(c.name||'The Company')} (TIN: ${esc(c.tin||'—')}) is registered and domiciled in Rwanda, with its registered address at ${esc(c.address||'—')}. These financial statements cover the period from ${dmy(from)} to ${dmy(to)}, with the statement of financial position presented as of ${dmy(asOf)}.</p>
+      <div class="field"><label>Nature of Business</label><textarea id="notesNatureOfBusiness" rows="2" placeholder="e.g. The company is engaged in the provision of accommodation, restaurant, and related hospitality services." style="width:100%;">${esc(nf.natureOfBusiness)}</textarea></div>
+    `)}
+
+    ${note('Basis of Preparation and Significant Accounting Policies', `
+      <table class="led"><tbody>
+        <tr><td style="width:220px;font-weight:600;">Basis of accounting</td><td>Accrual basis of accounting and the historical cost convention.</td></tr>
+        <tr><td style="font-weight:600;">Functional and presentation currency</td><td>Rwandan Franc (${esc(baseCurrencyCode())}). Transactions in other currencies are translated at the exchange rate ruling on the transaction date.</td></tr>
+        <tr><td style="font-weight:600;">Revenue recognition</td><td>Revenue is recognized when goods are delivered or services are rendered, at the amount expected to be received.</td></tr>
+        <tr><td style="font-weight:600;">Property, plant &amp; equipment</td><td>Stated at cost less accumulated depreciation. Depreciation is charged on a straight-line basis over each asset's estimated useful life.</td></tr>
+        ${n.hasInventory?`<tr><td style="font-weight:600;">Inventory</td><td>Stated at the lower of cost and net realizable value, using the weighted-average costing method.</td></tr>`:''}
+        <tr><td style="font-weight:600;">Value Added Tax (VAT)</td><td>Output and Input VAT are accounted for at ${(state.settings.vat*100).toFixed(0)}%, in line with Rwandan tax law.</td></tr>
+        <tr><td style="font-weight:600;">Corporate Income Tax</td><td>Provided for at the statutory rate of ${(state.settings.cit*100).toFixed(0)}% of taxable profit; recognized as a filing obligation rather than an automatic period-end accrual.</td></tr>
+        ${n.hasPayroll?`<tr><td style="font-weight:600;">Employee benefits</td><td>Pension, maternity, and community health insurance (CBHI) contributions are made in accordance with RSSB requirements under Rwandan law.</td></tr>`:''}
+      </tbody></table>
+    `)}
+
+    ${n.hasFixedAssets ? note('Property, Plant and Equipment', `
+      <table class="led">
+        <thead><tr><th>Category</th><th class="num-col">Cost</th><th class="num-col">Accumulated Depreciation</th><th class="num-col">Net Book Value</th></tr></thead>
+        <tbody>
+          ${n.ppeRows.map(r=>`<tr><td>${esc(r.category)}</td><td class="num-col num">${fmt(r.cost)}</td><td class="num-col num">${fmt(r.accumDepr)}</td><td class="num-col num">${fmt(r.nbv)}</td></tr>`).join('')}
+          <tr class="total-row"><td>Total</td><td class="num-col num">${fmt(n.ppeTotal.cost)}</td><td class="num-col num">${fmt(n.ppeTotal.accumDepr)}</td><td class="num-col num">${fmt(n.ppeTotal.nbv)}</td></tr>
+        </tbody>
+      </table>
+      <div class="note" style="margin-top:10px;">Net Book Value as of ${dmy(asOf)} agrees to the Balance Sheet. Depreciation is charged on a straight-line basis over each asset's estimated useful life, down to its salvage value.</div>
+    `) : ''}
+
+    ${note('Trade and Other Receivables', `
+      <table class="led"><tbody>
+        <tr><td>Accounts Receivable (trade debtors)</td><td class="num-col num">${fmt(n.arTotal)}</td></tr>
+        <tr class="total-row"><td>Total Trade and Other Receivables</td><td class="num-col num">${fmt(n.arTotal)}</td></tr>
+      </tbody></table>
+      <div class="note" style="margin-top:10px;">See the Accounts Receivable and Aged Debtors reports for a full breakdown by customer and age.</div>
+    `)}
+
+    ${note('Trade and Other Payables', `
+      <table class="led"><tbody>
+        <tr><td>Accounts Payable (trade creditors)</td><td class="num-col num">${fmt(n.apTotal)}</td></tr>
+        ${n.otherPayableRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num-col num">${fmt(r.amt)}</td></tr>`).join('')}
+        <tr class="total-row"><td>Total Trade and Other Payables</td><td class="num-col num">${fmt(n.totalPayables)}</td></tr>
+      </tbody></table>
+      <div class="note" style="margin-top:10px;">See the Accounts Payable and Aged Creditors reports for a full breakdown by supplier and age.</div>
+    `)}
+
+    ${n.hasInventory ? note('Inventory', `
+      <table class="led"><tbody>
+        <tr><td>Inventory on hand (${n.inventoryItemCount} item${n.inventoryItemCount===1?'':'s'}), at weighted-average cost</td><td class="num-col num">${fmt(n.inventoryTotal)}</td></tr>
+      </tbody></table>
+    `) : ''}
+
+    ${note('Cash and Cash Equivalents', `
+      <table class="led"><tbody>
+        ${n.cashRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num-col num">${fmt(r.amt)}</td></tr>`).join('')}
+        <tr class="total-row"><td>Total Cash and Cash Equivalents</td><td class="num-col num">${fmt(n.cashTotal)}</td></tr>
+      </tbody></table>
+    `)}
+
+    ${note('Share Capital and Reserves', `
+      <table class="led"><tbody>
+        ${n.equityRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num-col num">${fmt(r.amt)}</td></tr>`).join('')}
+        <tr><td>Retained Earnings (Undistributed Profit)</td><td class="num-col num">${fmt(n.bs.totalEquity - n.equityRows.reduce((s,r)=>s+r.amt,0))}</td></tr>
+        <tr class="total-row"><td>Total Equity</td><td class="num-col num">${fmt(n.bs.totalEquity)}</td></tr>
+      </tbody></table>
+      <div class="note" style="margin-top:10px;">See the Statement of Changes in Equity for the movement in each of these balances over the period.</div>
+    `)}
+
+    ${n.relatedPartyRows.length ? note('Related Party Transactions', `
+      <table class="led"><tbody>
+        ${n.relatedPartyRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num-col num">${fmt(r.amt)}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="note" style="margin-top:10px;">Amounts due to shareholders/directors, outstanding as of ${dmy(asOf)}.</div>
+    `) : ''}
+
+    ${n.hasPayroll ? note('Employee Benefits Expense', `
+      <table class="led"><tbody>
+        <tr><td>Number of employees on payroll</td><td class="num-col num">${n.headcount}</td></tr>
+        <tr><td>Total salaries, wages, and employer contributions for the period</td><td class="num-col num">${fmt(n.totalPayrollCost)}</td></tr>
+      </tbody></table>
+    `) : ''}
+
+    ${note('Taxation', `
+      <table class="led"><tbody>
+        <tr><td>VAT Claimed (asset)</td><td class="num-col num">${fmt(n.vatClaimedAmt)}</td></tr>
+        <tr><td>VAT Payable (liability)</td><td class="num-col num">${fmt(n.vatPayableAmt)}</td></tr>
+        <tr><td>Estimated Corporate Income Tax for the period (at ${(state.settings.cit*100).toFixed(0)}%)</td><td class="num-col num">${fmt(n.pl.estimatedCit)}</td></tr>
+      </tbody></table>
+      <div class="note" style="margin-top:10px;">See Tax Management for the full VAT filing history and CIT prepayment tracker.</div>
+    `)}
+
+    ${note('Contingent Liabilities and Commitments', `
+      <textarea id="notesContingencies" rows="2" style="width:100%;">${esc(nf.contingencies)}</textarea>
+    `)}
+
+    ${note('Subsequent Events', `
+      <textarea id="notesSubsequentEvents" rows="2" style="width:100%;">${esc(nf.subsequentEvents)}</textarea>
+    `)}
+
+    ${note('Going Concern', `
+      <textarea id="notesGoingConcern" rows="3" style="width:100%;">${esc(nf.goingConcern)}</textarea>
+    `)}
   `;
 }
 
@@ -12287,7 +12606,7 @@ function wireViewEvents(){
   }
 
   // Print / Save as PDF, and Export to Excel — shared across the financial statement tabs
-  if(['pl','bs','tb','cashflow','gl','aged','collection'].includes(activeTab)){
+  if(['pl','bs','tb','cashflow','gl','aged','collection','equity','notes'].includes(activeTab)){
     const glByAccountArgs = ()=>{
       const filtered = !!(glFrom || glTo);
       const rows = [...state.gl]
@@ -12384,6 +12703,46 @@ function wireViewEvents(){
       reportPeriodPreset = 'custom';
       renderMain();
     };
+  }
+
+  if(activeTab==='equity'){
+    const presetSel = document.getElementById('eqPeriodPreset');
+    if(presetSel) presetSel.onchange = ()=>{
+      reportPeriodPreset = presetSel.value;
+      const range = getPresetRange(reportPeriodPreset);
+      if(range){ periodFrom = range.from; periodTo = range.to; }
+      renderMain();
+    };
+    const apply = document.getElementById('eqApply');
+    if(apply) apply.onclick = ()=>{
+      periodFrom = document.getElementById('eqFrom').value;
+      periodTo = document.getElementById('eqTo').value;
+      reportPeriodPreset = 'custom';
+      renderMain();
+    };
+  }
+
+  if(activeTab==='notes'){
+    const applyBtn = document.getElementById('notesApply');
+    if(applyBtn) applyBtn.onclick = ()=>{
+      periodFrom = document.getElementById('notesFrom').value;
+      periodTo = document.getElementById('notesTo').value;
+      asOfDate = document.getElementById('notesAsOf').value;
+      renderMain();
+    };
+    const fieldMap = {
+      notesNatureOfBusiness: 'natureOfBusiness',
+      notesGoingConcern: 'goingConcern',
+      notesContingencies: 'contingencies',
+      notesSubsequentEvents: 'subsequentEvents',
+    };
+    Object.keys(fieldMap).forEach(elId=>{
+      const el = document.getElementById(elId);
+      if(el) el.onchange = ()=>{
+        state.settings.notesToFinancials[fieldMap[elId]] = el.value;
+        saveState();
+      };
+    });
   }
 
   if(activeTab==='gl'){
