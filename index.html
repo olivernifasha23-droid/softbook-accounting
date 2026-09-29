@@ -10189,7 +10189,16 @@ function printPayrollFullReport(){
     span.style.cssText = 'display:inline-block;min-width:140px;border-bottom:1px solid #999;padding:2px 4px;font-style:italic;';
     el.parentNode.replaceChild(span, el);
   });
-  scalePrintClone(branchClone, 1.3);
+  // The whole Employee Summary — every row, the Grand Total, and the
+  // sign-off lines — needs to land on this one first page, with the
+  // Payroll Accounts Recording section starting fresh on the next. A
+  // small roster can afford generously large print text; a large one
+  // (15+ employees, easily reaching two names that wrap to a second line)
+  // needs a tighter scale so the whole table still fits on a single page
+  // instead of spilling its last few rows onto an unwanted extra page.
+  const rowCount = printTicked.length;
+  const branchScale = rowCount>18 ? 0.95 : rowCount>12 ? 1.05 : rowCount>6 ? 1.15 : 1.3;
+  scalePrintClone(branchClone, branchScale);
 
   const summaryClone = summaryBox.cloneNode(true);
   summaryClone.querySelectorAll('button').forEach(el=>el.remove());
@@ -10227,8 +10236,9 @@ function printPayrollFullReport(){
   *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   body{font-family:Arial,Helvetica,sans-serif;padding:24px;color:#241F16;margin:0 auto;max-width:1100px;}
   table{width:100%;border-collapse:collapse;margin-top:8px;}
-  td,th{padding:6px 7px;font-size:12.5px;text-align:left;}
+  td,th{padding:5px 7px;font-size:12.5px;text-align:left;}
   th{border-bottom:1.5px solid #16233D;}
+  tr{ page-break-inside:avoid; break-inside:avoid; }
   .num{text-align:right;}
   .num-col{text-align:right;}
   /* Table headers and the Grand Total row need their own bold, colored
